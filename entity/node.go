@@ -110,6 +110,7 @@ func (Module) Type() NodeType { return ModuleNode }
 // Unidade de extração e porta de entrada de um diff
 type File struct {
 	Base
+	Name     string `json:"name"` // basename do path, para navegação
 	Path     string `json:"path"`
 	Language string `json:"language"`
 	Hash     string `json:"hash"`
@@ -153,6 +154,10 @@ type Function struct {
 	Kind       FunctionKind `json:"kind"`
 	Async      bool         `json:"async"`
 	Static     bool         `json:"static,omitempty"`
+	Abstract   bool         `json:"abstract,omitempty"`
+	Override   bool         `json:"override,omitempty"`
+	Private    bool         `json:"private,omitempty"`
+	Protected  bool         `json:"protected,omitempty"`
 	Exported   bool         `json:"exported"`
 	TypeName   string       `json:"typeName,omitempty"` // tipo de retorno, texto bruto
 	Decorators []string     `json:"decorators,omitempty"`
@@ -168,6 +173,9 @@ type Parameter struct {
 	Variadic   bool     `json:"variadic,omitempty"`
 	HasDefault bool     `json:"hasDefault,omitempty"`
 	Optional   bool     `json:"optional,omitempty"`
+	Readonly   bool     `json:"readonly,omitempty"`
+	Private    bool     `json:"private,omitempty"`
+	Protected  bool     `json:"protected,omitempty"`
 	TypeName   string   `json:"typeName,omitempty"`
 	Decorators []string `json:"decorators,omitempty"`
 }
@@ -220,6 +228,10 @@ type Field struct {
 	TypeName   string   `json:"typeName,omitempty"`
 	Static     bool     `json:"static,omitempty"`
 	Optional   bool     `json:"optional,omitempty"`
+	Readonly   bool     `json:"readonly,omitempty"`
+	Private    bool     `json:"private,omitempty"`
+	Protected  bool     `json:"protected,omitempty"`
+	Abstract   bool     `json:"abstract,omitempty"`
 	Decorators []string `json:"decorators,omitempty"`
 }
 
@@ -251,6 +263,7 @@ const (
 // Uma chamada. Os argumentos são edges ARGUMENT{index}; o alvo é a edge CALLS
 type Call struct {
 	CodeBase
+	Name       string   `json:"name"` // igual a CalleeText, para navegação no Neo4j Browser
 	Kind       CallKind `json:"kind"`
 	Awaited    bool     `json:"awaited,omitempty"`
 	CalleeText string   `json:"calleeText"`

@@ -39,6 +39,9 @@ const (
 	HasParamEdge  = EdgeType("HAS_PARAM")
 	BindsEdge     = EdgeType("BINDS")
 	RequestsEdge  = EdgeType("REQUESTS")
+
+	// decorator: Call → Class|Function|Parameter|Field
+	DecoratesEdge = EdgeType("DECORATES")
 )
 
 // Resolution indica a confiança de uma edge de resolução, fluxo ou contrato

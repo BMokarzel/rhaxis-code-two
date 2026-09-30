@@ -8,6 +8,7 @@ package javascript
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -15,8 +16,8 @@ import (
 	tstypescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
 	"github.com/BMokarzel/rhaxis-code-two/entity"
-	"github.com/BMokarzel/rhaxis-code-two/ir"
-	"github.com/BMokarzel/rhaxis-code-two/source"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/ir"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/source"
 )
 
 const (
@@ -72,6 +73,7 @@ func (e *Extractor) Extract(ctx context.Context, fileID string, f source.File) (
 		scopes: map[string]*ir.Scope{},
 		fg: &ir.FileGraph{File: entity.File{
 			Base:     entity.Base{NodeID: fileID},
+			Name:     filepath.Base(f.Path),
 			Path:     f.Path,
 			Language: f.Language,
 			Hash:     f.Hash,
@@ -112,6 +114,14 @@ type scope struct {
 	edge    entity.EdgeType
 	index   *int
 	awaited bool
+	// decoratee é o node ID do símbolo decorado (Class/Function/Parameter/Field).
+	// Quando != "" e walkamos um `decorator` node, o Call/identifier resultante recebe
+	// uma aresta DECORATES apontando para esse alvo.
+	decoratee string
+	// endpoint é o node ID do Endpoint HTTP que estamos processando (dentro de um método
+	// de controller). Permite que parameter() emita HttpParam quando encontrar
+	// @Param/@Body/@Query/@Headers.
+	endpoint string
 }
 
 func (s *scope) with(from string, edge entity.EdgeType, index *int) *scope {
@@ -121,9 +131,17 @@ func (s *scope) with(from string, edge entity.EdgeType, index *int) *scope {
 }
 
 type classInfo struct {
-	id      string
-	qual    string
-	members map[string]bool
+	id   string
+	qual string
+	// members mapeia nome do membro → node ID (Field/Function). Guardar o ID permite
+	// inferir HAS_TYPE em atribuições do tipo `this.X = new Y()`.
+	members map[string]string
+	// controller != nil quando a classe tem @Controller; carrega o basePath extraído.
+	controller *httpController
+}
+
+type httpController struct {
+	basePath string
 }
 
 type declared struct {
@@ -167,6 +185,7 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 			x.walk(child, &inner)
 		}
 	case "for_statement":
+		x.loopNode(n, c, "for_statement")
 		inner := *c
 		inner.scope = x.newScope(c.scope)
 		for _, child := range named(n) {
@@ -174,7 +193,43 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 		}
 	case "for_in_statement":
 		x.forIn(n, c)
+	case "while_statement", "do_statement":
+		x.loopNode(n, c, kind)
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
+	case "if_statement":
+		x.ifNode(n, c)
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
+	case "return_statement":
+		x.simpleStmt(n, c, entity.Return{})
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
+	case "throw_statement":
+		x.simpleStmt(n, c, entity.Throw{})
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
+	case "try_statement":
+		x.simpleStmt(n, c, entity.Try{})
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
+	case "switch_statement":
+		x.simpleStmt(n, c, entity.Switch{})
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
+	case "switch_case", "switch_default":
+		x.caseNode(n, c, kind == "switch_default")
+		for _, child := range named(n) {
+			x.walk(child, c)
+		}
 	case "catch_clause":
+		x.simpleStmt(n, c, entity.Catch{})
 		inner := *c
 		inner.scope = x.newScope(c.scope)
 		if p := n.ChildByFieldName("parameter"); p != nil {
@@ -213,8 +268,27 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 			x.walk(child, &inner)
 		}
 	case "assignment_expression":
-		x.write(n.ChildByFieldName("left"), "=", c)
-		if right := n.ChildByFieldName("right"); right != nil {
+		left := n.ChildByFieldName("left")
+		right := n.ChildByFieldName("right")
+		// CommonJS: `module.exports = ...` / `exports.<x> = ...` — trata como export
+		// e não emite WRITES para o pseudo-target `module`.
+		if x.commonjsExport(left, right, c) {
+			if right != nil {
+				x.walk(right, c)
+			}
+			return nil
+		}
+		x.write(left, "=", c)
+		if right != nil {
+			// `this.X = new Y()` dentro da classe: registra HAS_TYPE inferido no field
+			// para que chamadas do tipo `this.X.method()` sejam resolvidas no linker.
+			if c.class != nil && left != nil && right.Kind() == "new_expression" {
+				if root, path, ok := x.chain(left); ok && root == "this" && len(path) == 1 {
+					if fid, exists := c.class.members[path[0]]; exists && fid != "" {
+						x.inferNew(fid, right, c.scope)
+					}
+				}
+			}
 			x.walk(right, c)
 		}
 	case "augmented_assignment_expression":
@@ -420,6 +494,91 @@ func (x *fileExtractor) export(name, local, id string) {
 	x.edge(entity.Edge{Type: entity.ExportsEdge, From: x.fileID, To: id})
 }
 
+// commonjsExport detecta `module.exports = ...` e `exports.<name> = ...` e emite EXPORTS.
+// Retorna true quando o padrão foi reconhecido (o assignment não deve produzir WRITES).
+// O caminho ESM (export_statement) permanece intacto — este é apenas o complemento CJS.
+func (x *fileExtractor) commonjsExport(left, right *ts.Node, c *scope) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	root, path, ok := x.chain(left)
+	if !ok {
+		return false
+	}
+	// exports.<name> = <expr>
+	if root == "exports" && len(path) == 1 {
+		alias := path[0]
+		x.exportValue(alias, right, c)
+		return true
+	}
+	// module.exports = <expr> ou module.exports.<name> = <expr>
+	if root == "module" && len(path) >= 1 && path[0] == "exports" {
+		if len(path) == 1 {
+			// module.exports = <expr>
+			if right.Kind() == "object" {
+				x.exportObjectLiteral(right, c)
+				return true
+			}
+			// module.exports = SomeIdentifier / expression
+			x.exportValue("default", right, c)
+			return true
+		}
+		if len(path) == 2 {
+			// module.exports.<name> = <expr>
+			x.exportValue(path[1], right, c)
+			return true
+		}
+	}
+	return false
+}
+
+// exportObjectLiteral trata `{ A, B: alias, C: ClassX }` no RHS de module.exports.
+func (x *fileExtractor) exportObjectLiteral(obj *ts.Node, c *scope) {
+	for _, prop := range named(obj) {
+		switch prop.Kind() {
+		case "shorthand_property_identifier":
+			name := x.text(prop)
+			if id := x.resolveLocal(c.scope, name); id != "" {
+				x.export(name, name, id)
+			} else {
+				x.fg.Exports = append(x.fg.Exports, ir.Export{Kind: ir.ExportLocal, Name: name, Local: name})
+			}
+		case "pair":
+			key := prop.ChildByFieldName("key")
+			val := prop.ChildByFieldName("value")
+			if key == nil || val == nil {
+				continue
+			}
+			alias := x.text(key)
+			if val.Kind() == "identifier" {
+				local := x.text(val)
+				if id := x.resolveLocal(c.scope, local); id != "" {
+					x.export(alias, local, id)
+				} else {
+					x.fg.Exports = append(x.fg.Exports, ir.Export{Kind: ir.ExportLocal, Name: alias, Local: local})
+				}
+			}
+		}
+	}
+}
+
+// exportValue trata `module.exports = X` / `exports.foo = X` / `module.exports.foo = X`.
+// alias é o nome externo ("default" para module.exports = ...); o local vem do RHS.
+func (x *fileExtractor) exportValue(alias string, value *ts.Node, c *scope) {
+	if value.Kind() == "identifier" {
+		local := x.text(value)
+		if id := x.resolveLocal(c.scope, local); id != "" {
+			x.export(alias, local, id)
+			return
+		}
+		x.fg.Exports = append(x.fg.Exports, ir.Export{Kind: ir.ExportLocal, Name: alias, Local: local})
+		return
+	}
+	// Expressão anônima (função/classe inline). Ainda registra o Export como sinal,
+	// sem NodeID — o linker pode ignorar ou anexar depois.
+	x.fg.Exports = append(x.fg.Exports, ir.Export{Kind: ir.ExportLocal, Name: alias, Local: alias})
+}
+
 // ---------------------------------------------------------------- declarações
 
 // function declara uma função e percorre corpo e parâmetros. name vazio usa o campo "name" do node.
@@ -429,16 +588,21 @@ func (x *fileExtractor) function(n *ts.Node, c *scope, name string, kind entity.
 	}
 	qual := x.qualify(c.qual, name, n)
 	id := x.unique(qual, n)
+	priv, prot := x.accessibility(n)
 	fn := entity.Function{
 		CodeBase:   x.codeBase(id, n, c.owner),
 		Name:       name,
 		Kind:       kind,
 		Async:      hasToken(n, "async"),
 		Static:     hasToken(n, "static"),
+		Abstract:   n.Kind() == "abstract_method_signature" || hasToken(n, "abstract"),
+		Override:   hasToken(n, "override"),
+		Private:    priv,
+		Protected:  prot,
 		Exported:   exported,
 		Decorators: x.texts(append(decorators, childrenOfKind(n, "decorator")...)),
 	}
-	inner := &scope{owner: id, scope: x.newScope(c.scope), qual: qual, class: c.class, from: id, edge: entity.ReadsEdge}
+	inner := &scope{owner: id, scope: x.newScope(c.scope), qual: qual, class: c.class, from: id, edge: entity.ReadsEdge, endpoint: c.endpoint}
 	if rt := n.ChildByFieldName("return_type"); rt != nil {
 		fn.TypeName = typeText(x.text(rt))
 		x.typeRef(id, entity.ReturnsTypeEdge, rt, c.scope, false)
@@ -448,8 +612,10 @@ func (x *fileExtractor) function(n *ts.Node, c *scope, name string, kind entity.
 	if register && name != "" {
 		x.declare(c.scope, name, id)
 	}
+	decInner := *inner
+	decInner.decoratee = id
 	for _, d := range append(decorators, childrenOfKind(n, "decorator")...) {
-		x.walk(d, inner)
+		x.walk(d, &decInner)
 	}
 	if params := n.ChildByFieldName("parameters"); params != nil {
 		x.parameters(params, id, inner, kind == entity.FunctionConstructor)
@@ -484,17 +650,18 @@ func (x *fileExtractor) parameter(p *ts.Node, index int, fnID string, c *scope, 
 	pattern := p
 	var typeNode, value *ts.Node
 	property := false
+	var paramDecorators []*ts.Node
 	switch p.Kind() {
 	case "required_parameter", "optional_parameter":
 		pattern = p.ChildByFieldName("pattern")
 		typeNode = p.ChildByFieldName("type")
 		value = p.ChildByFieldName("value")
 		param.Optional = p.Kind() == "optional_parameter"
-		property = firstOfKind(p, "accessibility_modifier") != nil || hasToken(p, "readonly")
-		param.Decorators = x.texts(childrenOfKind(p, "decorator"))
-		for _, d := range childrenOfKind(p, "decorator") {
-			x.walk(d, c)
-		}
+		param.Readonly = hasToken(p, "readonly")
+		param.Private, param.Protected = x.accessibility(p)
+		property = firstOfKind(p, "accessibility_modifier") != nil || param.Readonly
+		paramDecorators = childrenOfKind(p, "decorator")
+		param.Decorators = x.texts(paramDecorators)
 	case "assignment_pattern":
 		pattern = p.ChildByFieldName("left")
 		value = p.ChildByFieldName("right")
@@ -526,6 +693,39 @@ func (x *fileExtractor) parameter(p *ts.Node, index int, fnID string, c *scope, 
 	if typeNode != nil {
 		x.typeRef(id, entity.HasTypeEdge, typeNode, c.scope, false)
 	}
+	if len(paramDecorators) > 0 {
+		decInner := *c
+		decInner.decoratee = id
+		for _, d := range paramDecorators {
+			x.walk(d, &decInner)
+		}
+		// HTTP: se estamos num método de controller e um decorator é @Param/@Body/etc,
+		// criamos HttpParam + HAS_PARAM Endpoint → HttpParam + BINDS HttpParam → Parameter.
+		if c.endpoint != "" {
+			for _, d := range paramDecorators {
+				dname, arg, _ := x.decoratorInfo(d)
+				kind := httpParamKindFromDecorator(dname)
+				if kind == "" {
+					continue
+				}
+				hpName := arg
+				if hpName == "" {
+					hpName = param.Name
+				}
+				hpID := x.unique(fmt.Sprintf("%s#httpparam:%s:%s", c.endpoint, kind, hpName), p)
+				x.node(entity.HttpParam{
+					Base:     entity.Base{NodeID: hpID},
+					Name:     hpName,
+					In:       kind,
+					TypeName: param.TypeName,
+					Required: !param.Optional && !param.HasDefault,
+				})
+				x.edge(entity.Edge{Type: entity.HasParamEdge, From: c.endpoint, To: hpID, Resolution: entity.ResolutionExact})
+				x.edge(entity.Edge{Type: entity.BindsEdge, From: hpID, To: id, Resolution: entity.ResolutionExact})
+				break
+			}
+		}
+	}
 	if value != nil {
 		x.walk(value, c)
 	}
@@ -538,13 +738,16 @@ func (x *fileExtractor) parameter(p *ts.Node, index int, fnID string, c *scope, 
 			Name:       param.Name,
 			TypeName:   param.TypeName,
 			Optional:   param.Optional,
+			Readonly:   param.Readonly,
+			Private:    param.Private,
+			Protected:  param.Protected,
 			Decorators: param.Decorators,
 		}
 		x.node(field)
 		x.edge(entity.Edge{Type: entity.HasFieldEdge, From: c.class.id, To: fid})
 		loc := x.loc(p)
 		x.edge(entity.Edge{Type: entity.WritesEdge, From: fnID, To: fid, Loc: &loc, Operator: "=", Resolution: entity.ResolutionExact})
-		c.class.members[param.Name] = true
+		c.class.members[param.Name] = fid
 		if typeNode != nil {
 			x.typeRef(fid, entity.HasTypeEdge, typeNode, c.scope, false)
 		}
@@ -567,12 +770,23 @@ func (x *fileExtractor) class(n *ts.Node, c *scope, name string, exported bool, 
 		x.declare(c.scope, name, id)
 	}
 
-	info := &classInfo{id: id, qual: qual, members: map[string]bool{}}
+	info := &classInfo{id: id, qual: qual, members: map[string]string{}}
 	classScope := x.newScope(c.scope)
 	x.declare(classScope, "this", id)
 	inner := &scope{owner: id, scope: classScope, qual: qual, class: info, from: id, edge: entity.ReadsEdge}
+	// Detecta @Controller antes de walk-arem os decorators: se a classe é um controller,
+	// guarda o basePath para usar quando emitir Endpoints por método.
 	for _, d := range decorators {
-		x.walk(d, inner)
+		if dname, arg, _ := x.decoratorInfo(d); dname == "Controller" {
+			info.controller = &httpController{basePath: arg}
+			break
+		}
+	}
+	// Decorators da classe recebem `decoratee = <classID>` para emitir DECORATES.
+	decInner := *inner
+	decInner.decoratee = id
+	for _, d := range decorators {
+		x.walk(d, &decInner)
 	}
 
 	if heritage := firstOfKind(n, "class_heritage"); heritage != nil {
@@ -598,7 +812,8 @@ func (x *fileExtractor) class(n *ts.Node, c *scope, name string, exported bool, 
 	}
 	for _, m := range named(body) {
 		if name := x.memberName(m); name != "" {
-			info.members[name] = true
+			// ID real será preenchido no segundo passo quando o membro for materializado.
+			info.members[name] = ""
 		}
 	}
 	var pending []*ts.Node
@@ -618,8 +833,38 @@ func (x *fileExtractor) class(n *ts.Node, c *scope, name string, exported bool, 
 			case hasToken(m, "set"):
 				kind = entity.FunctionSetter
 			}
-			mid := x.function(m, inner, name, kind, false, pending, false)
+			// HTTP: se a classe é um Controller e este método tem @Get/@Post/etc, cria o
+			// Endpoint antes de chamar function() para que parameter() possa emitir HttpParam.
+			var endpointID string
+			if info.controller != nil {
+				allDecos := append(append([]*ts.Node{}, pending...), childrenOfKind(m, "decorator")...)
+				for _, d := range allDecos {
+					dname, arg, _ := x.decoratorInfo(d)
+					if httpMethod := httpMethodFromDecorator(dname); httpMethod != "" {
+						path := joinHTTPPath(info.controller.basePath, arg)
+						endpointID = x.unique(fmt.Sprintf("%s#endpoint:%s %s", x.fileID, httpMethod, path), m)
+						x.node(entity.Endpoint{
+							Base:   entity.Base{NodeID: endpointID},
+							Method: httpMethod,
+							Path:   path,
+						})
+						x.edge(entity.Edge{Type: entity.ExposesEdge, From: x.fileID, To: endpointID, Resolution: entity.ResolutionExact})
+						break
+					}
+				}
+			}
+			methodInner := *inner
+			if endpointID != "" {
+				methodInner.endpoint = endpointID
+			}
+			mid := x.function(m, &methodInner, name, kind, false, pending, false)
 			x.edge(entity.Edge{Type: entity.HasMethodEdge, From: id, To: mid})
+			if name != "" {
+				info.members[name] = mid
+			}
+			if endpointID != "" {
+				x.edge(entity.Edge{Type: entity.HandledByEdge, From: endpointID, To: mid, Resolution: entity.ResolutionExact})
+			}
 		case "public_field_definition", "field_definition":
 			x.classField(m, inner, pending)
 		case "class_static_block":
@@ -640,11 +885,16 @@ func (x *fileExtractor) classField(m *ts.Node, c *scope, decorators []*ts.Node) 
 		return
 	}
 	id := x.unique(c.qual+"."+name, m)
+	priv, prot := x.accessibility(m)
 	field := entity.Field{
 		CodeBase:   x.codeBase(id, m, c.class.id),
 		Name:       name,
 		Static:     hasToken(m, "static"),
 		Optional:   hasToken(m, "?"),
+		Readonly:   hasToken(m, "readonly"),
+		Private:    priv,
+		Protected:  prot,
+		Abstract:   hasToken(m, "abstract"),
 		Decorators: x.texts(decorators),
 	}
 	typeNode := m.ChildByFieldName("type")
@@ -656,8 +906,12 @@ func (x *fileExtractor) classField(m *ts.Node, c *scope, decorators []*ts.Node) 
 	}
 	x.node(field)
 	x.edge(entity.Edge{Type: entity.HasFieldEdge, From: c.class.id, To: id})
-	for _, d := range decorators {
-		x.walk(d, c)
+	if len(decorators) > 0 {
+		decInner := *c
+		decInner.decoratee = id
+		for _, d := range decorators {
+			x.walk(d, &decInner)
+		}
 	}
 	if value != nil {
 		x.walk(value, c.with(id, entity.ReadsEdge, nil))
@@ -831,6 +1085,12 @@ func (x *fileExtractor) inferNew(id string, value *ts.Node, scopeID string) stri
 		return ""
 	}
 	x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: id, Edge: entity.HasTypeEdge, ScopeID: scopeID, Name: root, Path: path, Loc: x.loc(ctor), Inferred: true})
+	// Argumentos genéricos: `new Map<string, User>()` também liga o campo a User.
+	if args := value.ChildByFieldName("type_arguments"); args != nil {
+		for _, arg := range named(args) {
+			x.typeRef(id, entity.HasTypeEdge, arg, scopeID, true)
+		}
+	}
 	return x.text(ctor)
 }
 
@@ -879,6 +1139,7 @@ func (x *fileExtractor) requireSource(n *ts.Node) (string, bool) {
 }
 
 func (x *fileExtractor) forIn(n *ts.Node, c *scope) {
+	x.loopNode(n, c, "for_in_statement")
 	inner := *c
 	inner.scope = x.newScope(c.scope)
 	left := n.ChildByFieldName("left")
@@ -916,14 +1177,20 @@ func (x *fileExtractor) call(n *ts.Node, c *scope, kind entity.CallKind) {
 		calleeText = calleeText[:200]
 	}
 	id := x.unique(fmt.Sprintf("%s/call@%d:%d", c.qual, n.StartPosition().Row+1, n.StartPosition().Column+1), n)
-	x.node(entity.Call{CodeBase: x.codeBase(id, n, c.owner), Kind: kind, Awaited: c.awaited, CalleeText: calleeText})
+	x.node(entity.Call{CodeBase: x.codeBase(id, n, c.owner), Name: calleeText, Kind: kind, Awaited: c.awaited, CalleeText: calleeText})
 	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
 	x.valueEdge(c, id, n)
+	if c.decoratee != "" {
+		// @Injectable() sobre uma classe / @Get(':id') sobre um método: liga o Call → alvo.
+		x.edge(entity.Edge{Type: entity.DecoratesEdge, From: id, To: c.decoratee, Resolution: entity.ResolutionExact})
+	}
 
 	inner := c.with(id, entity.ReadsEdge, nil)
 	if callee != nil {
 		if root, path, ok := x.chain(callee); ok {
-			if root != "super" && !(root == "this" && len(path) == 0) {
+			// `this()` sozinho não é uma referência resolvível; `super` e `super.x` seguem
+			// como PendingRef e são resolvidos no linker via extends da classe corrente.
+			if !(root == "this" && len(path) == 0) {
 				edge := entity.CallsEdge
 				if kind == entity.CallNew {
 					edge = entity.InstantiatesEdge
@@ -962,11 +1229,13 @@ func (x *fileExtractor) write(left *ts.Node, op string, c *scope) {
 	}
 	if root, path, ok := x.chain(left); ok {
 		// JavaScript: `this.value = x` dentro da classe declara o campo
-		if root == "this" && len(path) == 1 && c.class != nil && !c.class.members[path[0]] {
-			fid := x.unique(c.class.qual+"."+path[0], left)
-			x.node(entity.Field{CodeBase: x.codeBase(fid, left, c.class.id), Name: path[0]})
-			x.edge(entity.Edge{Type: entity.HasFieldEdge, From: c.class.id, To: fid})
-			c.class.members[path[0]] = true
+		if root == "this" && len(path) == 1 && c.class != nil {
+			if fid, exists := c.class.members[path[0]]; !exists || fid == "" {
+				newFid := x.unique(c.class.qual+"."+path[0], left)
+				x.node(entity.Field{CodeBase: x.codeBase(newFid, left, c.class.id), Name: path[0]})
+				x.edge(entity.Edge{Type: entity.HasFieldEdge, From: c.class.id, To: newFid})
+				c.class.members[path[0]] = newFid
+			}
 		}
 		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: c.owner, Edge: entity.WritesEdge, ScopeID: c.scope, Name: root, Path: path, Loc: x.loc(left), Operator: op})
 		return
@@ -1036,8 +1305,23 @@ func (x *fileExtractor) typeRef(from string, edge entity.EdgeType, t *ts.Node, s
 			return
 		}
 		x.typeRef(from, edge, name, scopeID, inferred)
+		// Argumentos genéricos (Map<K, V>, Repository<User>): também emitem HAS_TYPE
+		// para o portador. Assim `Map<string, User>` liga o Field a Map E a User.
+		if args := firstOfKind(t, "type_arguments"); args != nil {
+			for _, arg := range named(args) {
+				x.typeRef(from, edge, arg, scopeID, inferred)
+			}
+		}
 	case "array_type":
 		x.typeRef(from, edge, firstNamed(t), scopeID, inferred)
+	case "union_type", "intersection_type":
+		for _, member := range named(t) {
+			x.typeRef(from, edge, member, scopeID, inferred)
+		}
+	case "tuple_type":
+		for _, member := range named(t) {
+			x.typeRef(from, edge, member, scopeID, inferred)
+		}
 	}
 }
 
@@ -1079,6 +1363,192 @@ func (x *fileExtractor) declare(scopeID, name, id string) {
 		return
 	}
 	x.scopes[scopeID].Names[name] = id
+}
+
+// stmtID gera um ID único para um statement node (If/Loop/Throw/Return/Try/Catch/Switch/Case).
+func (x *fileExtractor) stmtID(kind string, n *ts.Node, c *scope) string {
+	return x.unique(fmt.Sprintf("%s#%s@%d:%d", c.qual, kind, n.StartPosition().Row+1, n.StartPosition().Column+1), n)
+}
+
+// simpleStmt emite um node de statement (Return/Throw/Try/Catch/Switch) e sua aresta CONTAINS.
+// Retorna o ID emitido para permitir arestas posteriores (por exemplo, NEXT).
+// nodeProto é uma instância zerada do tipo concreto (entity.Return{}, entity.Throw{}, ...);
+// a função preenche o CodeBase a partir do AST.
+func (x *fileExtractor) simpleStmt(n *ts.Node, c *scope, nodeProto entity.Node) string {
+	kind := string(nodeProto.Type())
+	id := x.stmtID(kind, n, c)
+	base := x.codeBase(id, n, c.owner)
+	var node entity.Node
+	switch nodeProto.(type) {
+	case entity.Return:
+		node = entity.Return{CodeBase: base}
+	case entity.Throw:
+		node = entity.Throw{CodeBase: base}
+	case entity.Try:
+		node = entity.Try{CodeBase: base}
+	case entity.Catch:
+		node = entity.Catch{CodeBase: base}
+	case entity.Switch:
+		node = entity.Switch{CodeBase: base}
+	default:
+		return ""
+	}
+	x.node(node)
+	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
+	return id
+}
+
+// ifNode emite um If com a condição como texto e a aresta CONTAINS.
+func (x *fileExtractor) ifNode(n *ts.Node, c *scope) string {
+	id := x.stmtID("If", n, c)
+	cond := ""
+	if condNode := n.ChildByFieldName("condition"); condNode != nil {
+		cond = x.text(condNode)
+		if len(cond) > 200 {
+			cond = cond[:200]
+		}
+	}
+	x.node(entity.If{CodeBase: x.codeBase(id, n, c.owner), ConditionText: cond})
+	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
+	return id
+}
+
+// loopNode emite um Loop (while/do/for/for_in/for_of) inferindo Kind pelo node kind.
+func (x *fileExtractor) loopNode(n *ts.Node, c *scope, kind string) string {
+	loopKind := "for"
+	switch kind {
+	case "while_statement":
+		loopKind = "while"
+	case "do_statement":
+		loopKind = "do_while"
+	case "for_statement":
+		loopKind = "for"
+	case "for_in_statement":
+		// tree-sitter usa "for_in_statement" tanto para for-in quanto para for-of;
+		// diferencia pelo token "of" na assinatura.
+		loopKind = "for_in"
+		if hasToken(n, "of") {
+			loopKind = "for_of"
+		}
+	}
+	id := x.stmtID("Loop", n, c)
+	x.node(entity.Loop{CodeBase: x.codeBase(id, n, c.owner), Kind: loopKind})
+	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
+	return id
+}
+
+// caseNode emite um Case (switch case ou default).
+func (x *fileExtractor) caseNode(n *ts.Node, c *scope, isDefault bool) string {
+	id := x.stmtID("Case", n, c)
+	x.node(entity.Case{CodeBase: x.codeBase(id, n, c.owner), IsDefault: isDefault})
+	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
+	return id
+}
+
+// httpMethodFromDecorator devolve o método HTTP para @Get/@Post/... ou "" caso não seja.
+func httpMethodFromDecorator(name string) string {
+	switch name {
+	case "Get", "HttpGet":
+		return "GET"
+	case "Post", "HttpPost":
+		return "POST"
+	case "Put", "HttpPut":
+		return "PUT"
+	case "Patch", "HttpPatch":
+		return "PATCH"
+	case "Delete", "HttpDelete":
+		return "DELETE"
+	case "Options":
+		return "OPTIONS"
+	case "Head":
+		return "HEAD"
+	case "All":
+		return "ALL"
+	}
+	return ""
+}
+
+// httpParamKindFromDecorator mapeia @Param/@Body/... para o campo `in` do OpenAPI.
+func httpParamKindFromDecorator(name string) string {
+	switch name {
+	case "Param":
+		return "path"
+	case "Body":
+		return "body"
+	case "Query":
+		return "query"
+	case "Headers":
+		return "header"
+	}
+	return ""
+}
+
+// decoratorInfo extrai o nome e o primeiro argumento string de um decorator node.
+// Cobre `@X`, `@X()`, `@X('a')`, `@X('a', ...)`. `hasCall` diferencia `@X` de `@X()`.
+func (x *fileExtractor) decoratorInfo(d *ts.Node) (name, firstArg string, hasCall bool) {
+	inner := firstNamed(d)
+	if inner == nil {
+		return "", "", false
+	}
+	switch inner.Kind() {
+	case "identifier":
+		return x.text(inner), "", false
+	case "call_expression":
+		callee := inner.ChildByFieldName("function")
+		if callee != nil {
+			name = x.text(callee)
+		}
+		if args := inner.ChildByFieldName("arguments"); args != nil {
+			for _, a := range named(args) {
+				if a.Kind() == "string" {
+					firstArg = unquote(x.text(a))
+					break
+				}
+			}
+		}
+		return name, firstArg, true
+	}
+	return "", "", false
+}
+
+// joinPath junta basePath e methodPath cuidando das barras.
+func joinHTTPPath(base, method string) string {
+	base = strings.TrimSpace(base)
+	method = strings.TrimSpace(method)
+	if base == "" && method == "" {
+		return "/"
+	}
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
+	if method != "" && !strings.HasPrefix(method, "/") {
+		method = "/" + method
+	}
+	base = strings.TrimSuffix(base, "/")
+	if method == "" {
+		if base == "" {
+			return "/"
+		}
+		return base
+	}
+	return base + method
+}
+
+// resolveLocal sobe a cadeia de escopos procurando o node ID declarado para name.
+// Usado por padrões CommonJS (`module.exports = { A }`) onde a resolução precisa acontecer
+// no parser antes de emitir a aresta EXPORTS.
+func (x *fileExtractor) resolveLocal(scopeID, name string) string {
+	for s := scopeID; s != ""; {
+		sc, ok := x.scopes[s]
+		if !ok {
+			break
+		}
+		if id, ok := sc.Names[name]; ok {
+			return id
+		}
+		s = sc.ParentID
+	}
+	return ""
 }
 
 func (x *fileExtractor) qualify(parent, name string, n *ts.Node) string {
@@ -1183,6 +1653,21 @@ func hasToken(n *ts.Node, token string) bool {
 		}
 	}
 	return false
+}
+
+// accessibility devolve (private, protected) lendo `accessibility_modifier`
+func (x *fileExtractor) accessibility(n *ts.Node) (bool, bool) {
+	mod := firstOfKind(n, "accessibility_modifier")
+	if mod == nil {
+		return false, false
+	}
+	switch x.text(mod) {
+	case "private":
+		return true, false
+	case "protected":
+		return false, true
+	}
+	return false, false
 }
 
 // patternIdentifiers devolve os identificadores declarados por um padrão (a, {a, b: c}, [a, ...b])

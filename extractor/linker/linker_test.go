@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/BMokarzel/rhaxis-code-two/entity"
-	"github.com/BMokarzel/rhaxis-code-two/ir"
-	"github.com/BMokarzel/rhaxis-code-two/linker"
-	"github.com/BMokarzel/rhaxis-code-two/linker/javascript"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/ir"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/linker"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/linker/javascript"
 )
 
 func base(id string) entity.CodeBase { return entity.CodeBase{Base: entity.Base{NodeID: id}} }

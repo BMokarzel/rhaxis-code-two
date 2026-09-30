@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/BMokarzel/rhaxis-code-two/entity"
-	"github.com/BMokarzel/rhaxis-code-two/ir"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/ir"
 )
 
 // Target é o destino de um import: um arquivo da aplicação ou um pacote externo
@@ -197,7 +197,18 @@ func (r *run) link() *entity.Graph {
 
 func (r *run) linkType(ref ir.PendingRef) {
 	sym, rest, _ := r.resolvePath(ref.ScopeID, ref.Name, ref.Path)
-	if len(rest) > 0 || sym.nodeID == "" {
+	if len(rest) > 0 {
+		return
+	}
+	if sym.nodeID == "" {
+		// Tipos externos (Map, Array, Date, etc.) não geram HAS_TYPE, mas ainda são
+		// registrados em typeOf para que chamadas do tipo `this.field.method()` resolvam
+		// para uma aresta CALLS Call → External.
+		if ref.Edge == entity.HasTypeEdge && sym.external != "" {
+			if _, exists := r.typeOf[ref.From]; !exists {
+				r.typeOf[ref.From] = symbol{external: sym.external, res: entity.ResolutionNameOnly}
+			}
+		}
 		return
 	}
 	switch r.nodes[sym.nodeID].Type() {
@@ -270,7 +281,102 @@ func (r *run) linkImports(fc *fileCtx) {
 			continue
 		}
 		r.addEdge(entity.Edge{Type: entity.ImportsEdge, From: fc.fg.File.ID(), To: to, Resolution: entity.ResolutionExact})
+		// BINDS por símbolo: rastreia quais nomes específicos atravessam a fronteira.
+		// IMPORTS é a aresta grossa por arquivo/pacote; BINDS é fina por símbolo.
+		switch imp.Kind {
+		case ir.ImportNamed, ir.ImportDefault:
+			sym := r.resolveImport(fc, imp)
+			if id := r.materializeBind(sym); id != "" {
+				edge := entity.Edge{Type: entity.BindsEdge, From: fc.fg.File.ID(), To: id, Resolution: sym.res}
+				if imp.Local != "" && imp.Imported != "" && imp.Local != imp.Imported {
+					edge.Member = imp.Local // alias local (import { A as C })
+				}
+				r.addEdge(edge)
+			}
+		}
 	}
+	// Barrel re-exports (`export * from`, `export { X } from`): a fonte é uma dependência
+	// (IMPORTS) e cada símbolo re-exportado precisa da aresta EXPORTS do barrel para o node.
+	for _, e := range fc.fg.Exports {
+		if e.Source == "" {
+			continue
+		}
+		t, ok := fc.resolver.Resolve(fc.fg.File.Path, e.Source)
+		if !ok {
+			continue
+		}
+		var to string
+		if t.Package != "" {
+			to = r.materialize(symbol{pkg: t.Package})
+		} else if target, found := r.files[t.FilePath]; found {
+			to = target.fg.File.ID()
+		}
+		if to != "" {
+			r.addEdge(entity.Edge{Type: entity.ImportsEdge, From: fc.fg.File.ID(), To: to, Resolution: entity.ResolutionExact})
+		}
+		switch e.Kind {
+		case ir.ExportReexport:
+			sym := r.followReexport(fc, e, e.Local, map[string]bool{})
+			if id := r.materializeExport(sym); id != "" {
+				r.addEdge(entity.Edge{Type: entity.ExportsEdge, From: fc.fg.File.ID(), To: id, Resolution: sym.res})
+			}
+		case ir.ExportReexportAll:
+			if t.Package != "" {
+				continue // pacote externo: sem lista de exportados
+			}
+			target, found := r.files[t.FilePath]
+			if !found {
+				continue
+			}
+			for name := range target.exports {
+				if name == "default" {
+					continue
+				}
+				sym := r.resolveExport(target, name, map[string]bool{})
+				if id := r.materializeExport(sym); id != "" {
+					r.addEdge(entity.Edge{Type: entity.ExportsEdge, From: fc.fg.File.ID(), To: id, Resolution: sym.res})
+				}
+			}
+		}
+	}
+}
+
+// materializeExport devolve o node ID de destino de um símbolo para uma aresta EXPORTS.
+// Diferente de materialize() genérico, evita criar External para exports não resolvidos.
+func (r *run) materializeExport(sym symbol) string {
+	switch {
+	case sym.nodeID != "":
+		return sym.nodeID
+	case sym.module != nil:
+		return sym.module.fg.File.ID()
+	case sym.pkg != "":
+		return r.materialize(sym)
+	}
+	return ""
+}
+
+// materializeBind resolve o alvo de uma aresta BINDS.
+// Para `import { readFile } from 'node:fs/promises'`, cria (uma vez) um External `readFile`
+// e retorna seu ID; o Package `node:fs` continua sendo o alvo da IMPORTS.
+func (r *run) materializeBind(sym symbol) string {
+	switch {
+	case sym.nodeID != "":
+		return sym.nodeID
+	case sym.module != nil:
+		return sym.module.fg.File.ID()
+	case sym.pkg != "":
+		if sym.member == "" {
+			return r.materialize(symbol{pkg: sym.pkg})
+		}
+		// External nomeado, sob o package: id = pkg:<pkg>/<member>
+		id := "pkg:" + sym.pkg + "/" + sym.member
+		if !r.created[id] {
+			r.created[id] = true
+			r.addNode(entity.External{Base: entity.Base{NodeID: id}, Name: sym.member})
+		}
+		return id
+	}
+	return ""
 }
 
 // deriveInvokes resume CALLS em Function → Function
@@ -314,6 +420,18 @@ func (r *run) resolvePath(scopeID, name string, path []string) (symbol, []string
 }
 
 func (r *run) lookup(scopeID, name string) symbol {
+	// super se resolve para o parent da classe corrente (via cadeia de extends).
+	// O parent é aquele em que a busca de membro (super.x) e a construção (super())
+	// vão continuar.
+	if name == "super" {
+		thisSym := r.lookup(scopeID, "this")
+		if thisSym.nodeID != "" {
+			if parents := r.extends[thisSym.nodeID]; len(parents) > 0 {
+				return symbol{nodeID: parents[0], res: entity.ResolutionExact}
+			}
+		}
+		return symbol{}
+	}
 	for id := scopeID; id != ""; {
 		s, ok := r.scopes[id]
 		if !ok {
@@ -443,6 +561,11 @@ func (r *run) member(sym symbol, seg string) (symbol, bool) {
 		t, ok := r.typeOf[owner]
 		if !ok {
 			return symbol{}, false
+		}
+		// Valor com tipo externo (Map, Array, ...): carrega o membro pendente para
+		// que a chamada saia como CALLS Call → External com Member = "<method>".
+		if t.external != "" {
+			return symbol{external: t.external, member: seg, res: weaker(res, t.res)}, true
 		}
 		owner = t.nodeID
 		res = weaker(res, t.res)

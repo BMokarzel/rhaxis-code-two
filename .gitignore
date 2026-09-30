@@ -1,2 +1,3 @@
 /rhaxis
 *.graph.json
+.env

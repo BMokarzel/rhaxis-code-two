@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/BMokarzel/rhaxis-code-two/entity"
-	"github.com/BMokarzel/rhaxis-code-two/ir"
-	"github.com/BMokarzel/rhaxis-code-two/linker"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/ir"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/linker"
 )
 
 func TestResolve(t *testing.T) {

@@ -6,13 +6,13 @@ import (
 
 	"github.com/BMokarzel/rhaxis-code-two/entity"
 	"github.com/BMokarzel/rhaxis-code-two/extractor"
-	"github.com/BMokarzel/rhaxis-code-two/extractor/javascript"
-	"github.com/BMokarzel/rhaxis-code-two/linker"
-	jsresolver "github.com/BMokarzel/rhaxis-code-two/linker/javascript"
-	"github.com/BMokarzel/rhaxis-code-two/orchestrator"
-	"github.com/BMokarzel/rhaxis-code-two/repository/memory"
-	"github.com/BMokarzel/rhaxis-code-two/source"
-	"github.com/BMokarzel/rhaxis-code-two/source/local"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/linker"
+	jsresolver "github.com/BMokarzel/rhaxis-code-two/extractor/linker/javascript"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/parser"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/parser/javascript"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/repository/memory"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/source"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/source/local"
 )
 
 const (
@@ -26,18 +26,18 @@ const (
 
 func extractSample(t *testing.T) *entity.Graph {
 	t.Helper()
-	registry := extractor.NewRegistry(javascript.New())
+	registry := parser.NewRegistry(javascript.New())
 	js := jsresolver.NewFactory()
 	mem := memory.New()
-	o := &orchestrator.Orchestrator{
-		Extractor: registry,
+	o := &extractor.Extractor{
+		Parser: registry,
 		Linker: linker.New(map[string]linker.ResolverFactory{
 			javascript.LangJavaScript: js, javascript.LangTypeScript: js, javascript.LangTSX: js,
 		}),
 		Repository: mem,
 	}
 	app := entity.Application{Base: entity.Base{NodeID: "app:nest"}, Name: "nest", Key: "nest"}
-	report, err := o.Run(context.Background(), app, local.New("../../testdata/nest-sample", registry.Extensions()))
+	report, err := o.Run(context.Background(), app, local.New("../../../testdata/nest-sample", registry.Extensions()))
 	if err != nil {
 		t.Fatal(err)
 	}

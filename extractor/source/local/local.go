@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/BMokarzel/rhaxis-code-two/source"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/source"
 )
 
 var defaultIgnore = map[string]bool{

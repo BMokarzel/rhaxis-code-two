@@ -8,7 +8,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/BMokarzel/rhaxis-code-two/linker"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/linker"
 )
 
 var extensions = []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}

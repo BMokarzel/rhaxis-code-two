@@ -1,48 +1,115 @@
-// Package extractor define a extração de um arquivo para o formato intermediário (ir).
-// Cada linguagem tem seu subdiretório.
+// Package extractor é a aplicação de extração: captura → parsing → linkagem → persistência.
+// Depende só das interfaces de source, parser, linker e repository.
 package extractor
 
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sort"
+	"sync"
 
-	"github.com/BMokarzel/rhaxis-code-two/ir"
-	"github.com/BMokarzel/rhaxis-code-two/source"
+	"github.com/BMokarzel/rhaxis-code-two/entity"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/ir"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/linker"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/repository"
+	"github.com/BMokarzel/rhaxis-code-two/extractor/source"
 )
 
-type Extractor interface {
-	// Languages são os valores de source.File.Language que o extrator aceita
-	Languages() []string
-	// Extensions mapeia extensão de arquivo para linguagem
-	Extensions() map[string]string
-	// Extract recebe o ID do file (estável entre extrações) e o arquivo
+type Parser interface {
 	Extract(ctx context.Context, fileID string, f source.File) (*ir.FileGraph, error)
 }
 
-type Registry struct {
-	byLanguage map[string]Extractor
-	extensions map[string]string
+type Linker interface {
+	Link(ctx context.Context, in linker.Input) (*entity.Graph, error)
 }
 
-func NewRegistry(extractors ...Extractor) *Registry {
-	r := &Registry{byLanguage: map[string]Extractor{}, extensions: map[string]string{}}
-	for _, e := range extractors {
-		for _, l := range e.Languages() {
-			r.byLanguage[l] = e
-		}
-		for ext, l := range e.Extensions() {
-			r.extensions[ext] = l
-		}
-	}
-	return r
+type Extractor struct {
+	Parser     Parser
+	Linker     Linker
+	Repository repository.GraphRepository
+	Workers    int
 }
 
-func (r *Registry) Extensions() map[string]string { return r.extensions }
+type FileError struct {
+	Path string
+	Err  error
+}
 
-func (r *Registry) Extract(ctx context.Context, fileID string, f source.File) (*ir.FileGraph, error) {
-	e, ok := r.byLanguage[f.Language]
-	if !ok {
-		return nil, fmt.Errorf("nenhum extrator para a linguagem %q", f.Language)
+type Report struct {
+	Files  int
+	Failed []FileError
+	Nodes  int
+	Edges  int
+}
+
+func FileID(app entity.Application, path string) string {
+	return app.Key + ":" + path
+}
+
+func (o *Extractor) Run(ctx context.Context, app entity.Application, src source.Provider) (*Report, error) {
+	workers := o.Workers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
 	}
-	return e.Extract(ctx, fileID, f)
+
+	type result struct {
+		fg   *ir.FileGraph
+		path string
+		err  error
+	}
+	files := make(chan source.File)
+	results := make(chan result)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range files {
+				fg, err := o.Parser.Extract(ctx, FileID(app, f.Path), f)
+				results <- result{fg: fg, path: f.Path, err: err}
+			}
+		}()
+	}
+
+	var walkErr error
+	go func() {
+		walkErr = src.Walk(ctx, func(f source.File) error {
+			select {
+			case files <- f:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		close(files)
+		wg.Wait()
+		close(results)
+	}()
+
+	report := &Report{}
+	var graphs []*ir.FileGraph
+	for r := range results {
+		report.Files++
+		if r.err != nil {
+			report.Failed = append(report.Failed, FileError{Path: r.path, Err: r.err})
+			continue
+		}
+		graphs = append(graphs, r.fg)
+	}
+	if walkErr != nil {
+		return report, fmt.Errorf("lendo arquivos: %w", walkErr)
+	}
+	sort.Slice(graphs, func(i, j int) bool { return graphs[i].File.Path < graphs[j].File.Path })
+
+	g, err := o.Linker.Link(ctx, linker.Input{App: app, Files: graphs, ReadFile: src.ReadFile})
+	if err != nil {
+		return report, fmt.Errorf("linkando: %w", err)
+	}
+	report.Nodes, report.Edges = len(g.Nodes), len(g.Edges)
+
+	if err := o.Repository.ReplaceApplication(ctx, app, g); err != nil {
+		return report, fmt.Errorf("persistindo: %w", err)
+	}
+	return report, nil
 }
