@@ -1,0 +1,7 @@
+{
+  // Nest padrão
+  "compilerOptions": {
+    "baseUrl": "./",
+    "paths": { "@shared/*": ["src/shared/*"] },
+  },
+}
