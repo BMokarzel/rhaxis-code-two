@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -81,12 +82,10 @@ func (e *Extractor) Extract(ctx context.Context, fileID string, f source.File) (
 	}
 	x.fg.FileScopeID = x.newScope("")
 	root := &scope{owner: fileID, scope: x.fg.FileScopeID, from: fileID, edge: entity.ReadsEdge}
-	for _, child := range named(tree.RootNode()) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		x.walk(child, root)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	x.walkBlock(tree.RootNode(), root)
 	for _, id := range x.scopeOrder {
 		x.fg.Scopes = append(x.fg.Scopes, *x.scopes[id])
 	}
@@ -181,9 +180,7 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 	case "statement_block":
 		inner := *c
 		inner.scope = x.newScope(c.scope)
-		for _, child := range named(n) {
-			x.walk(child, &inner)
-		}
+		x.walkBlock(n, &inner)
 	case "for_statement":
 		x.loopNode(n, c, "for_statement")
 		inner := *c
@@ -204,14 +201,16 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 			x.walk(child, c)
 		}
 	case "return_statement":
-		x.simpleStmt(n, c, entity.Return{})
+		rid := x.simpleStmt(n, c, entity.Return{})
+		inner := c.with(rid, entity.ReadsEdge, nil)
 		for _, child := range named(n) {
-			x.walk(child, c)
+			x.walk(child, inner)
 		}
 	case "throw_statement":
-		x.simpleStmt(n, c, entity.Throw{})
+		tid := x.simpleStmt(n, c, entity.Throw{})
+		inner := c.with(tid, entity.ReadsEdge, nil)
 		for _, child := range named(n) {
-			x.walk(child, c)
+			x.walk(child, inner)
 		}
 	case "try_statement":
 		x.simpleStmt(n, c, entity.Try{})
@@ -278,7 +277,8 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 			}
 			return nil
 		}
-		x.write(left, "=", c)
+		inner := x.assignmentNode(n, c, "=")
+		x.write(left, "=", inner)
 		if right != nil {
 			// `this.X = new Y()` dentro da classe: registra HAS_TYPE inferido no field
 			// para que chamadas do tipo `this.X.method()` sejam resolvidas no linker.
@@ -289,20 +289,22 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 					}
 				}
 			}
-			x.walk(right, c)
+			x.walk(right, inner)
 		}
 	case "augmented_assignment_expression":
 		op := x.text(n.ChildByFieldName("operator"))
-		x.write(n.ChildByFieldName("left"), op, c)
+		inner := x.assignmentNode(n, c, op)
+		x.write(n.ChildByFieldName("left"), op, inner)
 		if right := n.ChildByFieldName("right"); right != nil {
-			x.walk(right, c)
+			x.walk(right, inner)
 		}
 	case "update_expression":
 		op := "++"
 		if strings.Contains(x.text(n), "--") {
 			op = "--"
 		}
-		x.write(n.ChildByFieldName("argument"), op, c)
+		inner := x.assignmentNode(n, c, op)
+		x.write(n.ChildByFieldName("argument"), op, inner)
 	case "arrow_function", "function_expression", "function", "generator_function":
 		fk := entity.FunctionExpression
 		if kind == "arrow_function" {
@@ -320,6 +322,10 @@ func (x *fileExtractor) walkDecl(n *ts.Node, c *scope, exported bool, decorators
 		if v := n.ChildByFieldName("value"); v != nil {
 			x.walk(v, c)
 		}
+	case "break_statement":
+		x.jumpStmt(n, c, "break")
+	case "continue_statement":
+		x.jumpStmt(n, c, "continue")
 	case "labeled_statement":
 		if body := n.ChildByFieldName("body"); body != nil {
 			x.walk(body, c)
@@ -337,7 +343,7 @@ func skipKind(kind string) bool {
 	case "comment", "this", "super", "string", "number", "true", "false", "null", "undefined", "regex",
 		"property_identifier", "private_property_identifier", "statement_identifier", "hash_bang_line",
 		"type_alias_declaration", "ambient_declaration", "import_alias", "debugger_statement",
-		"break_statement", "continue_statement", "empty_statement":
+		"empty_statement":
 		return true
 	}
 	return isTypeKind(kind)
@@ -624,9 +630,7 @@ func (x *fileExtractor) function(n *ts.Node, c *scope, name string, kind entity.
 	}
 	if body := n.ChildByFieldName("body"); body != nil {
 		if body.Kind() == "statement_block" {
-			for _, child := range named(body) {
-				x.walk(child, inner)
-			}
+			x.walkBlock(body, inner)
 		} else {
 			x.walk(body, inner)
 		}
@@ -1029,7 +1033,17 @@ func (x *fileExtractor) variables(n *ts.Node, c *scope, exported bool) []declare
 				continue
 			}
 		}
-		for _, ident := range patternIdentifiers(nameNode) {
+		// Com value, embrulha o declarator num Assignment para que:
+		//   - WRITES saia do Assignment → cada identificador declarado (destructuring também);
+		//   - READS/CALLS/INSTANTIATES do RHS saiam do Assignment;
+		//   - deriveFlowsTo liga RHS → cada LHS (ex.: `const {a,b} = obj` → obj FLOWS_TO a,b).
+		// Sem value (ex.: `let x;`), não cria Assignment.
+		inner := c
+		if value != nil {
+			inner = x.assignmentNode(d, c, "=")
+		}
+		for _, b := range x.patternBindings(nameNode) {
+			ident := b.Ident
 			id := x.variable(ident, c, kind, exported, d.ChildByFieldName("type"))
 			if nameNode.Kind() == "identifier" && d.ChildByFieldName("type") == nil && value != nil {
 				x.setVariableType(id, x.inferNew(id, value, c.scope))
@@ -1037,11 +1051,11 @@ func (x *fileExtractor) variables(n *ts.Node, c *scope, exported bool) []declare
 			out = append(out, declared{name: x.text(ident), id: id})
 			if value != nil {
 				loc := x.loc(ident)
-				x.edge(entity.Edge{Type: entity.WritesEdge, From: c.owner, To: id, Loc: &loc, Operator: "=", Resolution: entity.ResolutionExact})
+				x.edge(entity.Edge{Type: entity.WritesEdge, From: inner.from, To: id, Loc: &loc, Operator: "=", Member: b.Member, Resolution: entity.ResolutionExact})
 			}
 		}
 		if value != nil {
-			x.walk(value, c)
+			x.walk(value, inner)
 		}
 	}
 	return out
@@ -1085,10 +1099,14 @@ func (x *fileExtractor) inferNew(id string, value *ts.Node, scopeID string) stri
 		return ""
 	}
 	x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: id, Edge: entity.HasTypeEdge, ScopeID: scopeID, Name: root, Path: path, Loc: x.loc(ctor), Inferred: true})
-	// Argumentos genéricos: `new Map<string, User>()` também liga o campo a User.
+	// Argumentos genéricos: `new Map<string, User>()` liga o campo a User via HAS_TYPE_ARG.
+	// Mantém HAS_TYPE para o container (Map), HAS_TYPE_ARG{index:i} para cada arg que resolve.
 	if args := value.ChildByFieldName("type_arguments"); args != nil {
+		i := 0
 		for _, arg := range named(args) {
-			x.typeRef(id, entity.HasTypeEdge, arg, scopeID, true)
+			idx := i
+			x.typeRefIndexed(id, entity.HasTypeArgEdge, arg, scopeID, true, &idx)
+			i++
 		}
 	}
 	return x.text(ctor)
@@ -1237,13 +1255,14 @@ func (x *fileExtractor) write(left *ts.Node, op string, c *scope) {
 				c.class.members[path[0]] = newFid
 			}
 		}
-		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: c.owner, Edge: entity.WritesEdge, ScopeID: c.scope, Name: root, Path: path, Loc: x.loc(left), Operator: op})
+		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: c.from, Edge: entity.WritesEdge, ScopeID: c.scope, Name: root, Path: path, Loc: x.loc(left), Operator: op})
 		return
 	}
 	switch left.Kind() {
 	case "object_pattern", "array_pattern":
-		for _, ident := range patternIdentifiers(left) {
-			x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: c.owner, Edge: entity.WritesEdge, ScopeID: c.scope, Name: x.text(ident), Loc: x.loc(ident), Operator: op})
+		for _, b := range x.patternBindings(left) {
+			ident := b.Ident
+			x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: c.from, Edge: entity.WritesEdge, ScopeID: c.scope, Name: x.text(ident), Loc: x.loc(ident), Operator: op, Member: b.Member})
 		}
 	case "subscript_expression":
 		x.write(left.ChildByFieldName("object"), op, c)
@@ -1283,20 +1302,28 @@ func (x *fileExtractor) chain(n *ts.Node) (string, []string, bool) {
 
 // typeRef registra uma referência de tipo; tipos primitivos, uniões e literais são ignorados
 func (x *fileExtractor) typeRef(from string, edge entity.EdgeType, t *ts.Node, scopeID string, inferred bool) {
+	x.typeRefIndexed(from, edge, t, scopeID, inferred, nil)
+}
+
+// typeRefIndexed é a versão com índice (usada para HAS_TYPE_ARG). Para edges onde ordem
+// não importa (HAS_TYPE, RETURNS_TYPE, EXTENDS, IMPLEMENTS), passar index=nil.
+func (x *fileExtractor) typeRefIndexed(from string, edge entity.EdgeType, t *ts.Node, scopeID string, inferred bool, index *int) {
 	t = unwrapType(t)
 	if t == nil {
 		return
 	}
 	switch t.Kind() {
 	case "type_identifier", "identifier":
-		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: from, Edge: edge, ScopeID: scopeID, Name: x.text(t), Loc: x.loc(t), Inferred: inferred})
+		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: from, Edge: edge, ScopeID: scopeID, Name: x.text(t), Loc: x.loc(t), Inferred: inferred, Index: index})
 	case "nested_type_identifier", "member_expression":
 		parts := strings.Split(x.text(t), ".")
-		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: from, Edge: edge, ScopeID: scopeID, Name: parts[0], Path: parts[1:], Loc: x.loc(t), Inferred: inferred})
+		x.fg.Refs = append(x.fg.Refs, ir.PendingRef{From: from, Edge: edge, ScopeID: scopeID, Name: parts[0], Path: parts[1:], Loc: x.loc(t), Inferred: inferred, Index: index})
 	case "generic_type":
 		name := t.ChildByFieldName("name")
 		switch x.text(name) {
 		case "Promise", "Observable", "Array", "ReadonlyArray", "Partial", "Readonly", "Required":
+			// Wrappers: desembrulham para o tipo interno, preservando a edge do portador.
+			// `Promise<User>` em RETURNS_TYPE → User direto (unwrap transparente).
 			if args := firstOfKind(t, "type_arguments"); args != nil {
 				if first := firstNamed(args); first != nil {
 					x.typeRef(from, edge, first, scopeID, inferred)
@@ -1305,11 +1332,16 @@ func (x *fileExtractor) typeRef(from string, edge entity.EdgeType, t *ts.Node, s
 			return
 		}
 		x.typeRef(from, edge, name, scopeID, inferred)
-		// Argumentos genéricos (Map<K, V>, Repository<User>): também emitem HAS_TYPE
-		// para o portador. Assim `Map<string, User>` liga o Field a Map E a User.
+		// Argumentos genéricos (Map<K, V>, Repository<User>) emitem HAS_TYPE_ARG com Index.
+		// Assim `Map<string, User>` liga o Field a Map (HAS_TYPE) E a User (HAS_TYPE_ARG{index:1}),
+		// permitindo consumidores distinguirem o container do argumento. Recursão em args mantém
+		// a edge HAS_TYPE_ARG — tipos aninhados continuam marcados como argumento de tipo.
 		if args := firstOfKind(t, "type_arguments"); args != nil {
+			i := 0
 			for _, arg := range named(args) {
-				x.typeRef(from, edge, arg, scopeID, inferred)
+				idx := i
+				x.typeRefIndexed(from, entity.HasTypeArgEdge, arg, scopeID, inferred, &idx)
+				i++
 			}
 		}
 	case "array_type":
@@ -1384,6 +1416,12 @@ func (x *fileExtractor) simpleStmt(n *ts.Node, c *scope, nodeProto entity.Node) 
 		node = entity.Return{CodeBase: base}
 	case entity.Throw:
 		node = entity.Throw{CodeBase: base}
+		// THROWS Function → Throw: função dona (quando houver) pode lançar aquela expressão.
+		// Owner == fileID significa throw em topo de arquivo (raro, mas ignorado para não
+		// emitir uma edge semanticamente estranha de File→Throw).
+		if c.owner != "" && c.owner != x.fileID {
+			x.edge(entity.Edge{Type: entity.ThrowsEdge, From: c.owner, To: id, Resolution: entity.ResolutionExact})
+		}
 	case entity.Try:
 		node = entity.Try{CodeBase: base}
 	case entity.Catch:
@@ -1435,6 +1473,69 @@ func (x *fileExtractor) loopNode(n *ts.Node, c *scope, kind string) string {
 	x.node(entity.Loop{CodeBase: x.codeBase(id, n, c.owner), Kind: loopKind})
 	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
 	return id
+}
+
+// jumpStmt emite um Jump (break/continue) com rótulo opcional. CONTAINS do owner.
+// Preserva a informação de saída de laço/switch que antes era descartada em skipKind.
+func (x *fileExtractor) jumpStmt(n *ts.Node, c *scope, kind string) string {
+	id := x.stmtID("Jump", n, c)
+	label := ""
+	if lbl := firstOfKind(n, "statement_identifier"); lbl != nil {
+		label = x.text(lbl)
+	}
+	x.node(entity.Jump{CodeBase: x.codeBase(id, n, c.owner), Kind: kind, Label: label})
+	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
+	return id
+}
+
+// walkBlock percorre os filhos de um bloco (statement_block, program ou corpo de função
+// `{...}`) emitindo `NEXT` entre statements consecutivos. A ordem é a textual (named
+// children do tree-sitter).
+//
+// Heurística para identificar o "statement node" produzido por cada filho: snapshot do
+// comprimento de `x.fg.Edges` antes do walk; depois, a primeira edge `CONTAINS` com
+// `From == c.owner` adicionada é o nó de statement do filho. Isso funciona porque todos
+// os helpers (`simpleStmt`, `ifNode`, `loopNode`, `caseNode`, `jumpStmt`, `assignmentNode`,
+// `call`) emitem o node e **em seguida** `CONTAINS owner → id` antes de descer na
+// subárvore. Statements que não produzem node próprio (declaração pura de variável sem
+// init com efeito colateral, type_alias, comentários, etc.) são pulados — o `NEXT` então
+// liga o statement anterior ao próximo com node.
+func (x *fileExtractor) walkBlock(n *ts.Node, c *scope) {
+	var prev string
+	for _, child := range named(n) {
+		before := len(x.fg.Edges)
+		x.walk(child, c)
+		stmtID := firstContainedStmt(x.fg.Edges, before, c.owner)
+		if stmtID == "" {
+			continue
+		}
+		if prev != "" && prev != stmtID {
+			x.edge(entity.Edge{Type: entity.NextEdge, From: prev, To: stmtID})
+		}
+		prev = stmtID
+	}
+}
+
+func firstContainedStmt(edges []entity.Edge, from int, owner string) string {
+	for i := from; i < len(edges); i++ {
+		e := edges[i]
+		if e.Type == entity.ContainsEdge && e.From == owner {
+			return e.To
+		}
+	}
+	return ""
+}
+
+// assignmentNode emite um Assignment (`=`, `+=`, `++`, ...) e devolve um scope filho em que
+// `from` aponta para o Assignment. Assim:
+//   - `write(left, op, inner)` registra WRITES Assignment → LHS;
+//   - `walk(right, inner)` registra READS/CALLS/INSTANTIATES com origem no Assignment.
+// `owner` permanece o Function/File dono para que Call.OwnerID e CONTAINS continuem válidos.
+func (x *fileExtractor) assignmentNode(n *ts.Node, c *scope, op string) *scope {
+	id := x.stmtID("Assignment", n, c)
+	x.node(entity.Assignment{CodeBase: x.codeBase(id, n, c.owner), Operator: op})
+	x.edge(entity.Edge{Type: entity.ContainsEdge, From: c.owner, To: id})
+	return c.with(id, entity.ReadsEdge, nil)
 }
 
 // caseNode emite um Case (switch case ou default).
@@ -1686,6 +1787,73 @@ func patternIdentifiers(n *ts.Node) []*ts.Node {
 		var out []*ts.Node
 		for _, child := range named(n) {
 			out = append(out, patternIdentifiers(child)...)
+		}
+		return out
+	}
+	return nil
+}
+
+// patternBinding carrega o identificador ligado e a chave/índice de origem no padrão.
+// Member é não-vazio só quando o identificador vem de uma extração nomeada (`{a}` → "a";
+// `{b: c}` → "b"; `[x, y]` → "0" ou "1"). Quando o alvo é um identificador simples ou
+// não há como inferir o path, Member fica vazio.
+type patternBinding struct {
+	Ident  *ts.Node
+	Member string
+}
+
+func (x *fileExtractor) patternBindings(n *ts.Node) []patternBinding {
+	return x.patternBindingsPrefix(n, "")
+}
+
+func (x *fileExtractor) patternBindingsPrefix(n *ts.Node, prefix string) []patternBinding {
+	if n == nil {
+		return nil
+	}
+	switch n.Kind() {
+	case "identifier":
+		return []patternBinding{{Ident: n, Member: prefix}}
+	case "shorthand_property_identifier_pattern":
+		m := prefix
+		if m == "" {
+			m = x.text(n)
+		}
+		return []patternBinding{{Ident: n, Member: m}}
+	case "pair_pattern":
+		key := n.ChildByFieldName("key")
+		val := n.ChildByFieldName("value")
+		keyText := ""
+		if key != nil {
+			keyText = unquote(x.text(key))
+		}
+		return x.patternBindingsPrefix(val, keyText)
+	case "assignment_pattern", "object_assignment_pattern":
+		return x.patternBindingsPrefix(n.ChildByFieldName("left"), prefix)
+	case "rest_pattern":
+		return x.patternBindingsPrefix(firstNamed(n), prefix)
+	case "object_pattern":
+		var out []patternBinding
+		for _, child := range named(n) {
+			out = append(out, x.patternBindingsPrefix(child, "")...)
+		}
+		return out
+	case "array_pattern":
+		// A posição depende das vírgulas: `[x, y]` → x@0, y@1; `[, y]` → y@1; `[x, , z]` → x@0, z@2.
+		// Começa em 0; cada vírgula incrementa; identificador toma o índice corrente.
+		var out []patternBinding
+		idx := 0
+		for i := uint(0); i < n.ChildCount(); i++ {
+			child := n.Child(i)
+			if child == nil {
+				continue
+			}
+			if !child.IsNamed() {
+				if x.text(child) == "," {
+					idx++
+				}
+				continue
+			}
+			out = append(out, x.patternBindingsPrefix(child, strconv.Itoa(idx))...)
 		}
 		return out
 	}

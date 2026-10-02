@@ -20,18 +20,20 @@ const (
 	ArgumentEdge = EdgeType("ARGUMENT") // Call → portador de valor {index}
 
 	// resolução
-	ImportsEdge      = EdgeType("IMPORTS")      // File → File/Package
-	CallsEdge        = EdgeType("CALLS")        // Call → Function/External/Package
-	InstantiatesEdge = EdgeType("INSTANTIATES") // Call{new} → Class
-	HasTypeEdge      = EdgeType("HAS_TYPE")     // Variable/Parameter/Field → Class/Interface/Enum
-	ReturnsTypeEdge  = EdgeType("RETURNS_TYPE") // Function → Class/Interface/Enum
-	ExtendsEdge      = EdgeType("EXTENDS")      // Class → Class; Interface → Interface
-	ImplementsEdge   = EdgeType("IMPLEMENTS")   // Class → Interface
+	ImportsEdge      = EdgeType("IMPORTS")       // File → File/Package
+	CallsEdge        = EdgeType("CALLS")         // Call → Function/External/Package
+	InstantiatesEdge = EdgeType("INSTANTIATES")  // Call{new} → Class
+	HasTypeEdge      = EdgeType("HAS_TYPE")      // Variable/Parameter/Field → Class/Interface/Enum
+	HasTypeArgEdge   = EdgeType("HAS_TYPE_ARG")  // portador genérico → Class/Interface/Enum (arg de type_arguments) {index}
+	ReturnsTypeEdge  = EdgeType("RETURNS_TYPE")  // Function → Class/Interface/Enum
+	ExtendsEdge      = EdgeType("EXTENDS")       // Class → Class; Interface → Interface
+	ImplementsEdge   = EdgeType("IMPLEMENTS")    // Class → Interface
 
 	// fluxo (derivadas)
 	InvokesEdge = EdgeType("INVOKES") // Function → Function
 	FlowsToEdge = EdgeType("FLOWS_TO")
 	NextEdge    = EdgeType("NEXT")
+	ThrowsEdge  = EdgeType("THROWS") // Function → Throw (função pode lançar aquele throw)
 
 	// contrato
 	ExposesEdge   = EdgeType("EXPOSES")

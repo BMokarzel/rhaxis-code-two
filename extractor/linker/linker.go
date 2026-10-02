@@ -178,7 +178,7 @@ func (r *run) link() *entity.Graph {
 	var others []ir.PendingRef
 	for _, ref := range rest {
 		switch ref.Edge {
-		case entity.HasTypeEdge, entity.ReturnsTypeEdge:
+		case entity.HasTypeEdge, entity.ReturnsTypeEdge, entity.HasTypeArgEdge:
 			r.linkType(ref)
 		default:
 			others = append(others, ref)
@@ -192,6 +192,7 @@ func (r *run) link() *entity.Graph {
 		r.linkImports(r.files[fg.File.Path])
 	}
 	r.deriveInvokes()
+	r.deriveFlowsTo()
 	return r.graph
 }
 
@@ -220,11 +221,13 @@ func (r *run) linkType(ref ir.PendingRef) {
 	if ref.Inferred {
 		res = entity.ResolutionInferred
 	}
-	r.addEdge(entity.Edge{Type: ref.Edge, From: ref.From, To: sym.nodeID, Resolution: res})
+	r.addEdge(entity.Edge{Type: ref.Edge, From: ref.From, To: sym.nodeID, Index: ref.Index, Resolution: res})
 	switch ref.Edge {
 	case entity.ExtendsEdge, entity.ImplementsEdge:
 		r.extends[ref.From] = append(r.extends[ref.From], sym.nodeID)
 	case entity.HasTypeEdge, entity.ReturnsTypeEdge:
+		// HAS_TYPE_ARG não registra typeOf: o tipo "efetivo" do portador continua sendo o container
+		// (ex.: Map<string, User> → typeOf é Map, não User), para que `.get()` resolva no container.
 		if _, exists := r.typeOf[ref.From]; !exists {
 			r.typeOf[ref.From] = symbol{nodeID: sym.nodeID, res: res}
 		}
@@ -235,13 +238,20 @@ func (r *run) linkUse(ref ir.PendingRef) {
 	sym, rest, chain := r.resolvePath(ref.ScopeID, ref.Name, ref.Path)
 	loc := ref.Loc
 	to := r.materialize(sym)
+	member := strings.Join(append(nonEmpty(sym.member), rest...), ".")
+	// WRITES vindas de destructuring carregam o key/index de origem no PendingRef.Member;
+	// como o Name já é o próprio identificador declarado (não há path), o membro vindo da
+	// resolução fica vazio e podemos usar o do ref diretamente.
+	if ref.Member != "" && member == "" {
+		member = ref.Member
+	}
 	edge := entity.Edge{
 		Type:       ref.Edge,
 		From:       ref.From,
 		To:         to,
 		Index:      ref.Index,
 		Loc:        &loc,
-		Member:     strings.Join(append(nonEmpty(sym.member), rest...), "."),
+		Member:     member,
 		Operator:   ref.Operator,
 		Resolution: sym.res,
 	}
@@ -379,25 +389,177 @@ func (r *run) materializeBind(sym symbol) string {
 	return ""
 }
 
-// deriveInvokes resume CALLS em Function → Function
-func (r *run) deriveInvokes() {
+// deriveFlowsTo emite FLOWS_TO a partir das edges intra-procedurais já resolvidas:
+//
+//  1. Assignment: cada `Assignment -READS-> R` e `Assignment -WRITES-> W` produz `R -FLOWS_TO-> W`.
+//     Cobre `x = y`, `x = foo()` (R = Call → W = Var), `this.f = y`, destructuring parcial.
+//  2. Return: cada `Return -READS-> R` produz `R -FLOWS_TO-> Return`; a Return também
+//     emite `Return -FLOWS_TO-> Function(owner)` para o inter-procedural chainar via
+//     CALLS + Assignment do caller.
+//  3. Throw: análogo a Return (fluxo até o node Throw; Throw → Function não é emitido
+//     porque semanticamente o valor sai pela borda de exceção, não pelo retorno).
+//  4. Argumento → Parâmetro: `Call -ARGUMENT{i}-> X` + `Call -CALLS-> F` + `F -HAS_PARAMETER-> P{Index=i}`
+//     produz `X -FLOWS_TO-> P`. Só emite quando o alvo da CALLS é um Function node.
+//
+// FLOWS_TO é sempre emitido sem Loc, então duplicatas são absorvidas por addEdge.
+// Não emite auto-loops (R == W).
+func (r *run) deriveFlowsTo() {
+	type writeTarget struct {
+		id     string
+		member string
+	}
+	writesByAssign := map[string][]writeTarget{}
+	readsByAssign := map[string][]string{}
+	readsByReturn := map[string][]string{}
+	readsByThrow := map[string][]string{}
+	argsByCall := map[string]map[int]string{}
+	callsTarget := map[string]string{}
+	paramsByFunc := map[string]map[int]string{}
+
 	for _, e := range r.graph.Edges {
-		if e.Type != entity.CallsEdge {
+		from, okF := r.nodes[e.From]
+		if !okF {
 			continue
 		}
-		target, ok := r.nodes[e.To]
-		if !ok || target.Type() != entity.FunctionNode {
-			continue
+		switch e.Type {
+		case entity.WritesEdge:
+			if from.Type() == entity.AssignmentNode && e.To != "" {
+				writesByAssign[e.From] = append(writesByAssign[e.From], writeTarget{id: e.To, member: e.Member})
+			}
+		case entity.ReadsEdge:
+			if e.To == "" {
+				continue
+			}
+			switch from.Type() {
+			case entity.AssignmentNode:
+				readsByAssign[e.From] = append(readsByAssign[e.From], e.To)
+			case entity.ReturnNode:
+				readsByReturn[e.From] = append(readsByReturn[e.From], e.To)
+			case entity.ThrowNode:
+				readsByThrow[e.From] = append(readsByThrow[e.From], e.To)
+			}
+		case entity.ArgumentEdge:
+			if from.Type() == entity.CallNode && e.Index != nil && e.To != "" {
+				if argsByCall[e.From] == nil {
+					argsByCall[e.From] = map[int]string{}
+				}
+				argsByCall[e.From][*e.Index] = e.To
+			}
+		case entity.CallsEdge:
+			if from.Type() == entity.CallNode {
+				if to, ok := r.nodes[e.To]; ok && to.Type() == entity.FunctionNode {
+					callsTarget[e.From] = e.To
+				}
+			}
+		case entity.HasParameterEdge:
+			if p, ok := r.nodes[e.To].(entity.Parameter); ok {
+				if paramsByFunc[e.From] == nil {
+					paramsByFunc[e.From] = map[int]string{}
+				}
+				paramsByFunc[e.From][p.Index] = e.To
+			}
 		}
-		call, ok := r.nodes[e.From].(entity.Code)
+	}
+
+	// Regra 1: Assignment reads → Assignment writes. Em destructuring (`const {a} = obj`),
+	// o WRITES Assignment→a carrega Member="a"; propagamos para o FLOWS_TO para que o grafo
+	// expresse "obj flui para a especificamente pelo membro a" em vez de só "obj flui para a".
+	for aid, writes := range writesByAssign {
+		reads := readsByAssign[aid]
+		for _, w := range writes {
+			for _, rr := range reads {
+				if rr == w.id {
+					continue
+				}
+				r.addEdge(entity.Edge{Type: entity.FlowsToEdge, From: rr, To: w.id, Member: w.member, Resolution: entity.ResolutionExact})
+			}
+		}
+	}
+
+	// Regra 2: Return reads → Return → Function(owner)
+	for rid, reads := range readsByReturn {
+		for _, rr := range reads {
+			if rr == rid {
+				continue
+			}
+			r.addEdge(entity.Edge{Type: entity.FlowsToEdge, From: rr, To: rid, Resolution: entity.ResolutionExact})
+		}
+		if ret, ok := r.nodes[rid].(entity.Code); ok {
+			if owner := ret.Owner(); owner != "" {
+				if ownerNode, okO := r.nodes[owner]; okO && ownerNode.Type() == entity.FunctionNode {
+					r.addEdge(entity.Edge{Type: entity.FlowsToEdge, From: rid, To: owner, Resolution: entity.ResolutionExact})
+				}
+			}
+		}
+	}
+
+	// Regra 3: Throw reads → Throw
+	for tid, reads := range readsByThrow {
+		for _, rr := range reads {
+			if rr == tid {
+				continue
+			}
+			r.addEdge(entity.Edge{Type: entity.FlowsToEdge, From: rr, To: tid, Resolution: entity.ResolutionExact})
+		}
+	}
+
+	// Regra 4: Argumento → Parâmetro
+	for cid, args := range argsByCall {
+		fnID, ok := callsTarget[cid]
 		if !ok {
 			continue
 		}
-		owner, ok := r.nodes[call.Owner()]
-		if !ok || owner.Type() != entity.FunctionNode {
+		params := paramsByFunc[fnID]
+		if params == nil {
 			continue
 		}
-		r.addEdge(entity.Edge{Type: entity.InvokesEdge, From: owner.ID(), To: target.ID(), Resolution: e.Resolution})
+		for idx, argID := range args {
+			if pid, ok := params[idx]; ok && pid != argID {
+				r.addEdge(entity.Edge{Type: entity.FlowsToEdge, From: argID, To: pid, Resolution: entity.ResolutionExact})
+			}
+		}
+	}
+}
+
+// deriveInvokes resume CALLS em Function → Function. Também cobre callbacks passados por
+// posição a higher-order functions (Promise `.then(fn)`, `.catch(fn)`, `arr.map(fn)`,
+// `addEventListener('x', fn)`, etc.) — qualquer `Call -ARGUMENT-> Function` emite
+// `owner -INVOKES-> arg` com `Resolution=Inferred`, já que o HOF pode nunca chamar o
+// callback (ex.: `register(h)` que só armazena). Preferimos aceitar o falso-positivo em
+// troca de ver no grafo o grafo de callbacks real da maioria dos usos.
+func (r *run) deriveInvokes() {
+	for _, e := range r.graph.Edges {
+		switch e.Type {
+		case entity.CallsEdge:
+			target, ok := r.nodes[e.To]
+			if !ok || target.Type() != entity.FunctionNode {
+				continue
+			}
+			call, ok := r.nodes[e.From].(entity.Code)
+			if !ok {
+				continue
+			}
+			owner, ok := r.nodes[call.Owner()]
+			if !ok || owner.Type() != entity.FunctionNode {
+				continue
+			}
+			r.addEdge(entity.Edge{Type: entity.InvokesEdge, From: owner.ID(), To: target.ID(), Resolution: e.Resolution})
+		case entity.ArgumentEdge:
+			target, ok := r.nodes[e.To]
+			if !ok || target.Type() != entity.FunctionNode {
+				continue
+			}
+			call, ok := r.nodes[e.From].(entity.Code)
+			if !ok {
+				continue
+			}
+			owner, ok := r.nodes[call.Owner()]
+			if !ok || owner.Type() != entity.FunctionNode {
+				continue
+			}
+			res := weaker(e.Resolution, entity.ResolutionInferred)
+			r.addEdge(entity.Edge{Type: entity.InvokesEdge, From: owner.ID(), To: target.ID(), Resolution: res})
+		}
 	}
 }
 

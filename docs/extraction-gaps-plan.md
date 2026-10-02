@@ -1,5 +1,7 @@
 # Plano de fechamento dos gaps de extração
 
+> **Status 2026-10-01:** Etapas 1–6 já implementadas no código. Etapa 8 parcialmente feita (HAS_TYPE_ARG, break/continue como Jump, THROWS edge). As demais seguem pendentes. Ver `implementation-status.md` para auditoria por arquivo.
+
 Cada etapa lista: **objetivo**, **arquivos alvo**, **passos**, **fixtures que validam**, **critério de aceite**.
 Ordem sugerida segue custo × valor. Nada aqui muda o `entity/` sem necessidade — a maioria já tem o tipo definido, só falta emitir.
 

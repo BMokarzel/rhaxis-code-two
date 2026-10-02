@@ -32,6 +32,7 @@ const (
 	CaseNode       = NodeType("Case")
 	TryNode        = NodeType("Try")
 	CatchNode      = NodeType("Catch")
+	JumpNode       = NodeType("Jump")
 
 	// contrato
 	EndpointNode  = NodeType("Endpoint")
@@ -320,6 +321,16 @@ func (Try) Type() NodeType { return TryNode }
 type Catch struct{ CodeBase }
 
 func (Catch) Type() NodeType { return CatchNode }
+
+// Jump representa `break` ou `continue`, com label opcional (ex.: `break outer`).
+// Kind é "break" ou "continue". Permite rastrear saída de loop/switch quando houver NEXT.
+type Jump struct {
+	CodeBase
+	Kind  string `json:"kind"`
+	Label string `json:"label,omitempty"`
+}
+
+func (Jump) Type() NodeType { return JumpNode }
 
 // Representa o endpoint, a API, não é um node de código, é uma abstração
 // Possui edge HANDLED_BY apontando para a função handler

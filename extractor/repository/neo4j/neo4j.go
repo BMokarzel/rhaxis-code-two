@@ -24,6 +24,7 @@ var allowedEdgeTypes = map[entity.EdgeType]bool{
 	entity.FlowsToEdge: true, entity.NextEdge: true, entity.ExposesEdge: true,
 	entity.HandledByEdge: true, entity.HasParamEdge: true, entity.BindsEdge: true,
 	entity.RequestsEdge: true, entity.DecoratesEdge: true,
+	entity.HasTypeArgEdge: true, entity.ThrowsEdge: true,
 }
 
 type Repository struct {

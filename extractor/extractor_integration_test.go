@@ -24,6 +24,7 @@ var emittedNodeTypes = []entity.NodeType{
 	entity.FunctionNode, entity.ParameterNode, entity.VariableNode,
 	entity.ClassNode, entity.InterfaceNode, entity.FieldNode,
 	entity.EnumNode, entity.EnumMemberNode, entity.CallNode,
+	entity.AssignmentNode, entity.JumpNode,
 	entity.IfNode, entity.LoopNode, entity.ThrowNode, entity.ReturnNode,
 	entity.EndpointNode, entity.HttpParamNode,
 }
@@ -34,9 +35,9 @@ var emittedEdgeTypes = []entity.EdgeType{
 	entity.ExportsEdge, entity.ImportsEdge, entity.BindsEdge,
 	entity.ReadsEdge, entity.WritesEdge, entity.ArgumentEdge,
 	entity.CallsEdge, entity.InstantiatesEdge,
-	entity.HasTypeEdge, entity.ReturnsTypeEdge,
+	entity.HasTypeEdge, entity.HasTypeArgEdge, entity.ReturnsTypeEdge,
 	entity.ExtendsEdge, entity.ImplementsEdge,
-	entity.InvokesEdge,
+	entity.InvokesEdge, entity.ThrowsEdge, entity.NextEdge, entity.FlowsToEdge,
 	entity.DecoratesEdge, entity.ExposesEdge, entity.HandledByEdge, entity.HasParamEdge,
 }
 
@@ -81,14 +82,14 @@ func fixtures() []fixture {
 			mustHaveNodes: []entity.NodeType{
 				entity.FileNode, entity.PackageNode, entity.ExternalNode,
 				entity.ClassNode, entity.FunctionNode, entity.ParameterNode, entity.VariableNode,
-				entity.CallNode,
+				entity.CallNode, entity.AssignmentNode, entity.JumpNode,
 				entity.IfNode, entity.LoopNode, entity.ReturnNode,
 			},
 			mustHaveEdges: []entity.EdgeType{
 				entity.ContainsEdge, entity.DeclaresEdge, entity.HasParameterEdge,
 				entity.ExportsEdge, entity.ImportsEdge, entity.BindsEdge,
 				entity.ReadsEdge, entity.WritesEdge, entity.ArgumentEdge,
-				entity.CallsEdge, entity.InstantiatesEdge,
+				entity.CallsEdge, entity.InstantiatesEdge, entity.NextEdge, entity.FlowsToEdge,
 				entity.ExtendsEdge, entity.HasMethodEdge,
 			},
 		},

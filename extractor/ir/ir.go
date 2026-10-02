@@ -42,6 +42,10 @@ type PendingRef struct {
 	Loc   entity.Location
 	// Operator das escritas (=, +=, ++)
 	Operator string
+	// Member rastreia o key/index de origem em destructuring (`const {a} = obj` → Member="a";
+	// `[x, y] = arr` → Member="0" no WRITES de x). Usado só para WRITES por destructuring —
+	// nas resoluções normais, Member é derivado do caminho resolvido pelo linker.
+	Member string
 	// Inferred marca refs vindas de inferência do extrator (ex.: tipo a partir de `new X()`)
 	Inferred bool
 }

@@ -11,6 +11,8 @@ const double = (n) => n * 2;
 const range = (n = DEFAULT_LIMIT) => {
   const out = [];
   for (let i = 0; i < n; i += 1) {
+    if (i === 0) continue;
+    if (i >= n) break;
     out.push(i);
   }
   return out;

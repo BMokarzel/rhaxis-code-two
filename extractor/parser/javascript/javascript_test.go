@@ -2,6 +2,7 @@ package javascript_test
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/BMokarzel/rhaxis-code-two/entity"
@@ -56,6 +57,24 @@ func hasEdge(g *entity.Graph, typ entity.EdgeType, from, to string) *entity.Edge
 	return nil
 }
 
+// hasReachableEdge aceita a aresta direta ou um salto via CONTAINS. Útil para READS/WRITES
+// que a partir da Onda 2 saem de nós intermediários (Assignment/Return/Throw) embrulhados pela
+// função. Semântica: "a função X tem alguma leitura/escrita para Y, direta ou via statement
+// contido".
+func hasReachableEdge(g *entity.Graph, typ entity.EdgeType, from, to string) *entity.Edge {
+	if e := hasEdge(g, typ, from, to); e != nil {
+		return e
+	}
+	for _, e := range g.Edges {
+		if e.Type == entity.ContainsEdge && e.From == from {
+			if re := hasEdge(g, typ, e.To, to); re != nil {
+				return re
+			}
+		}
+	}
+	return nil
+}
+
 func node(g *entity.Graph, id string) entity.Node {
 	for _, n := range g.Nodes {
 		if n.ID() == id {
@@ -93,7 +112,13 @@ func TestNestSample(t *testing.T) {
 		{entity.ImportsEdge, "nest:src/legacy.js", "pkg:node:fs"},
 	}
 	for _, e := range edges {
-		if hasEdge(g, e.typ, e.from, e.to) == nil {
+		// READS/WRITES de função: desde a Onda 2 saem do Assignment/Return intermediário
+		// contido pela função, então aceita salto via CONTAINS.
+		find := hasEdge
+		if e.typ == entity.ReadsEdge || e.typ == entity.WritesEdge {
+			find = hasReachableEdge
+		}
+		if find(g, e.typ, e.from, e.to) == nil {
 			t.Errorf("faltou %s %s → %s", e.typ, e.from, e.to)
 		}
 	}
@@ -119,10 +144,20 @@ func TestNestSample(t *testing.T) {
 func TestWritesAndArguments(t *testing.T) {
 	g := extractSample(t)
 
+	// Wave 2: WRITES agora sai do nó Assignment (não da função). Reconstrói a origem via
+	// CONTAINS: Counter.inc -CONTAINS-> Assignment -WRITES{+=}-> Counter.value.
+	assignmentsInInc := map[string]bool{}
+	for _, e := range g.Edges {
+		if e.Type == entity.ContainsEdge && e.From == legacy+"Counter.inc" {
+			if n := node(g, e.To); n != nil && n.Type() == entity.AssignmentNode {
+				assignmentsInInc[e.To] = true
+			}
+		}
+	}
 	var incWrite, fieldArg, doubleArg, readFileCall bool
 	for _, e := range g.Edges {
 		switch {
-		case e.Type == entity.WritesEdge && e.From == legacy+"Counter.inc" && e.To == legacy+"Counter.value":
+		case e.Type == entity.WritesEdge && assignmentsInInc[e.From] && e.To == legacy+"Counter.value":
 			incWrite = e.Operator == "+="
 		case e.Type == entity.ArgumentEdge && e.To == svc+"UsersService.findOne.user" && e.Member == "email":
 			fieldArg = true // this.logger.log(user.email): user tem tipo desconhecido
@@ -143,6 +178,78 @@ func TestWritesAndArguments(t *testing.T) {
 	}
 	if !readFileCall {
 		t.Error("readFile(...) deveria gerar CALLS para pkg:node:fs com member readFile")
+	}
+}
+
+// TestDestructuringMember garante que destructuring preserva o key/index de origem
+// no WRITES (Member) e propaga para FLOWS_TO. Fixture inline porque todas as fixtures
+// reais usam destructuring só em `require(...)`, que é tratado como named import antes
+// de chegar no fluxo de Assignment.
+func TestDestructuringMember(t *testing.T) {
+	src := `
+const obj = { a: 1, b: 2 };
+const arr = [10, 20];
+function run() {
+  const { a, b: aliased } = obj;
+  const [x, y] = arr;
+  return a + aliased + x + y;
+}
+`
+	registry := parser.NewRegistry(javascript.New())
+	js := jsresolver.NewFactory()
+	mem := memory.New()
+	o := &extractor.Extractor{
+		Parser: registry,
+		Linker: linker.New(map[string]linker.ResolverFactory{
+			javascript.LangJavaScript: js, javascript.LangTypeScript: js, javascript.LangTSX: js,
+		}),
+		Repository: mem,
+	}
+	// escreve o arquivo num diretório temporário e extrai
+	dir := t.TempDir()
+	path := dir + "/destr.js"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := entity.Application{Base: entity.Base{NodeID: "app:d"}, Name: "d", Key: "d"}
+	if _, err := o.Run(context.Background(), app, local.New(dir, registry.Extensions())); err != nil {
+		t.Fatal(err)
+	}
+	g := mem.Graph(app.ID())
+	if g == nil {
+		t.Fatal("grafo vazio")
+	}
+
+	// WRITES de destructuring: localiza por Member no edge
+	wantWrites := map[string]bool{"a": false, "b": false, "0": false, "1": false}
+	for _, e := range g.Edges {
+		if e.Type != entity.WritesEdge || e.Member == "" {
+			continue
+		}
+		if _, ok := wantWrites[e.Member]; ok {
+			wantWrites[e.Member] = true
+		}
+	}
+	for m, found := range wantWrites {
+		if !found {
+			t.Errorf("WRITES com Member=%q não encontrado", m)
+		}
+	}
+
+	// FLOWS_TO propaga Member em destructuring (obj → a com Member=a)
+	wantFlows := map[string]bool{"a": false, "b": false, "0": false, "1": false}
+	for _, e := range g.Edges {
+		if e.Type != entity.FlowsToEdge || e.Member == "" {
+			continue
+		}
+		if _, ok := wantFlows[e.Member]; ok {
+			wantFlows[e.Member] = true
+		}
+	}
+	for m, found := range wantFlows {
+		if !found {
+			t.Errorf("FLOWS_TO com Member=%q não encontrado", m)
+		}
 	}
 }
 
