@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wsl:*)"
+      "Bash(wsl:*)",
+      "Read(//mnt/c/Users/User/Desktop/project-r/**)",
+      "Bash(/usr/local/go/bin/go test:*)",
+      "Bash(wsl.exe -- ls /mnt/c/Users/User/Desktop/project-r/)"
     ]
   }
 }

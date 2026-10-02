@@ -24,10 +24,17 @@ type Linker interface {
 	Link(ctx context.Context, in linker.Input) (*entity.Graph, error)
 }
 
+// Enricher roda depois da linkagem e antes da persistência, mutando o grafo in-place.
+// Usado para passos pós-link que precisam do grafo pronto (authorship, cross-service, ...).
+type Enricher interface {
+	Enrich(ctx context.Context, app entity.Application, g *entity.Graph) error
+}
+
 type Extractor struct {
 	Parser     Parser
 	Linker     Linker
 	Repository repository.GraphRepository
+	Enrichers  []Enricher
 	Workers    int
 }
 
@@ -106,6 +113,13 @@ func (o *Extractor) Run(ctx context.Context, app entity.Application, src source.
 	if err != nil {
 		return report, fmt.Errorf("linkando: %w", err)
 	}
+
+	for _, e := range o.Enrichers {
+		if err := e.Enrich(ctx, app, g); err != nil {
+			return report, fmt.Errorf("enriquecendo: %w", err)
+		}
+	}
+
 	report.Nodes, report.Edges = len(g.Nodes), len(g.Edges)
 
 	if err := o.Repository.ReplaceApplication(ctx, app, g); err != nil {

@@ -25,6 +25,10 @@ var allowedEdgeTypes = map[entity.EdgeType]bool{
 	entity.HandledByEdge: true, entity.HasParamEdge: true, entity.BindsEdge: true,
 	entity.RequestsEdge: true, entity.DecoratesEdge: true,
 	entity.HasTypeArgEdge: true, entity.ThrowsEdge: true,
+	entity.AuthoredByEdge: true, entity.CommittedByEdge: true, entity.ChangedEdge: true,
+	entity.MemberOfEdge: true, entity.OwnsEdge: true,
+	entity.CreatedEdge: true, entity.LastModifiedEdge: true,
+	entity.ProducesEdge: true, entity.ConsumesEdge: true,
 }
 
 type Repository struct {
@@ -176,6 +180,12 @@ func edgeProps(e entity.Edge) map[string]any {
 	}
 	if e.Resolution != "" {
 		p["resolution"] = string(e.Resolution)
+	}
+	if e.Kind != "" {
+		p["kind"] = e.Kind
+	}
+	if e.Share > 0 {
+		p["share"] = e.Share
 	}
 	return p
 }

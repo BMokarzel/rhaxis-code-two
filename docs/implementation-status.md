@@ -109,6 +109,113 @@ Resultado em fixture-b: `INVOKES=8` (antes 7), `Jump=2` (nova cobertura). Todos 
 
 Resultado em fixture-b: contagens de `Assignment=7` (parser) / `Assignment=16` (linker) e `FLOWS_TO=37` inalteradas — os valores vindos de destructuring nas fixtures existentes passam todos por `requireImport`, que não exercita o novo caminho. Cobertura real fica no teste focado.
 
+## Sprint G1 — Git source (2026-10-02)
+
+Primeira sprint do `docs/next-wave-plan.md`. Nenhuma mudança no parser/linker — só nova
+fonte de arquivos.
+
+| Item | Mudanças |
+|---|---|
+| `extractor/source/git/` | Novo pacote. `Provider` implementa `source.Provider` lendo de uma revisão sem checkout. Lista blobs via `git -C <repo> ls-tree -r -z --full-tree <rev> [-- <subdir>]` e lê conteúdo em lote via **um** processo `git cat-file --batch` (SHAs no stdin, cabeçalho + conteúdo + `\n` no stdout). `File.Hash` passa a ser o SHA do blob (40 hex); `File.Path` é relativo ao `Subdir`. |
+| Filtros | Mesmos de `source/local`: ignora `node_modules|dist|build|coverage|vendor`, diretórios ocultos, `.d.ts`, extensões fora do registry. Arquivos com nome começando por "." **não** são filtrados (bate com `local`). |
+| CLI `-rev` e `-subdir` | `extractor/cmd/main.go` ganhou duas flags. Sem `-rev` continua usando `source/local` (comportamento atual). Com `-rev <sha|branch|tag>` lê via git; `-subdir services/x` restringe ao subdir (bom para monorepo). `key` default vira `basename(subdir)` quando houver subdir. |
+| `buildSource` helper | Centraliza a escolha entre `local` e `gitsrc`. `runMemory`/`runNeo4j` passam a receber uma `source.Provider` já construída (sem conhecer o tipo). |
+| Testes | `TestGitSourceSelectsRevision` (2 commits, troca de conteúdo entre revisões), `TestGitSourceSubdir` (restrição por subdir), `TestGitSourceEquivalenceWithLocal` (`HEAD` produz mesmo conjunto de paths/content que `source/local`; só `Hash` muda de formato), `TestGitSourceReadFile` (ReadFile lê blobs arbitrários e falha corretamente em revisões sem o arquivo). Todos saltam com `t.Skip` se `git` não estiver no PATH. |
+
+Dependência externa: `git` CLI no PATH. Nenhum módulo Go novo.
+
+## Sprint G2 — Autoria mínima (2026-10-02)
+
+Segunda sprint do `docs/next-wave-plan.md`. Sem blame ainda — isso é Sprint G3.
+
+| Item | Mudanças |
+|---|---|
+| `entity.Commit`, `entity.Person`, `entity.Team` | Novos nodes com IDs **globais** (não prefixados por `<appKey>:`), portanto sobrevivem a reextrações da app. `CommitNode`, `PersonNode`, `TeamNode` adicionados aos NodeType. |
+| Edges de autoria | `AuthoredByEdge`, `CommittedByEdge`, `ChangedEdge`, `MemberOfEdge`, `OwnsEdge`, `CreatedEdge`, `LastModifiedEdge` em `entity/edge.go`. Sprint G2 só emite as três primeiras; o restante é reservado para G3. |
+| `Edge.Kind` | Novo campo opcional. Usado por `CHANGED` com `added|modified|deleted|renamed|copied|type_changed|touched`. Será reaproveitado por `OWNS` (`blame|codeowners|config`) no Sprint G3. Neo4j persiste como property `kind`. |
+| Whitelist Neo4j | `allowedEdgeTypes` em `extractor/repository/neo4j/neo4j.go` ganha os 7 novos tipos. `edgeProps` serializa `Kind`. |
+| `extractor.Enricher` | Nova interface + `Enrichers []Enricher` em `Extractor`. Roda **depois** do linker e **antes** da persistência. Mutação in-place no `*entity.Graph`. Usada por authorship e, no futuro, cross-service. |
+| `extractor/authorship/` | Novo pacote com `config.go` (schema + loader de `.rhaxis.yaml`), `person.go` (normalização de email + ID determinístico + hash sha256 opcional), `commit.go` (parse de `git log --use-mailmap --pretty=format:'%H%x1F...'` + `git diff-tree -r -z -M -C --root` com separadores NUL), `authorship.go` (orquestração + adapter `Enricher`). |
+| CHANGED (Commit → File) | Para cada commit, emite uma edge por arquivo tocado, com `Kind` traduzido do status A/M/D/R/C/T. **Só** emite se o File já existe no grafo (evita edges para arquivos binários/removidos/ignorados). `RenamedFrom` reaproveita o campo `Member`. |
+| CLI | Flags novas em `extractor/cmd/main.go`: `-config`, `-authorship`/`-no-authorship`, `-store-email=plain|hash|none`, `-commits-range`, `-commits-limit`. `.rhaxis.yaml` opcional; flags sobrescrevem. |
+| go.mod | `gopkg.in/yaml.v3` v3.0.1 agora é dependência (indireta por não haver `_` import, mas usada). |
+| Testes | `TestEnrichDisabledIsNoop`, `TestEnrichCommitPersonChanged` (repo de 3 commits, 2 autores, deleção de arquivo), `TestEnrichStoreEmailHash`/`None`, `TestLoadFileMissing`/`YAML`, `TestConfigValidateRejectsInvalid`. Todos saltam se `git` não estiver no PATH. |
+
+**Decisão explícita:** CHANGED aponta para File (não para declaração) nesta sprint. Dar granularidade por declaração sem blame geraria overestimate (toda declaração do arquivo tocado seria marcada). A precisão por declaração entra no Sprint G3 via `CREATED` e `LAST_MODIFIED` (que usam blame).
+
+**Decisão explícita:** CommitNode e PersonNode são globais (não prefixados por `<appKey>:`). Isso significa que `deleteApp` do Neo4j não os remove ao reextrair a app — mesmo Commit pode ser referenciado por múltiplas apps do mesmo repo. CHANGED edges são deletadas em cascata quando a File é deletada e recriadas na próxima extração + authorship.
+
+## Sprint G3 — Blame por declaração (2026-10-02)
+
+Terceira sprint. Escopo reduzido para apenas Person (sem Teams/CODEOWNERS, conforme ajuste de escopo do usuário em 2026-10-02).
+
+| Item | Mudanças |
+|---|---|
+| `Edge.Share` | Novo campo opcional `float64` em `entity/edge.go`. Usado por `OWNS` como fração de linhas atribuídas (0..1). `edgeProps` do Neo4j serializa quando `> 0`. |
+| `extractor/authorship/blame.go` | `runBlame` executa `git blame --porcelain -w -M -C <rev> -- <path>`. `parseBlame` entende o formato porcelain (header SHA, bloco de metadata só na primeira ocorrência de cada commit, linha de conteúdo com TAB como terminador). Cache por SHA para não repetir alocação por linha. `--use-mailmap` foi omitido porque git ≤2.34 não aceita a flag no `blame`; mailmap continua opt-in via `blame.mailmap=true` no repo. |
+| `extractor/authorship/ownership.go` | `isOwnableDeclaration` filtra Function/Class/Interface/Field/Enum/EnumMember + Variable top-level (Owner termina em `.ts/.js/.tsx/.jsx`). `collectDecls` agrupa por File com `span` ascendente para `innermost` escolher a declaração mais interna que contém a linha. `deriveOwnership` roda blame uma vez por File do grafo, acumula `declStats` (autores, min/max author-time) e emite `OWNS` (ordenado por personID para determinismo), `CREATED` (minPerson), `LAST_MODIFIED` (maxPerson). |
+| `OWNS.Kind="blame"` + `Share` | Toda edge de `OWNS` desta sprint tem `Kind="blame"` e `Share = autor_lines / total_lines`. Soma dos shares por declaração ≈ 1. |
+| Integração | `Enrich` em `authorship.go` chama `deriveOwnership` depois dos CHANGED. Blame de arquivo untracked/removido vira log em stderr (`authorship: blame <path>: <err>`) e segue; não derruba a extração. |
+| Testes | `TestOwnershipBlameEmitsOwnsCreatedLastModified` (repo de 3 commits de 2 autores em `svc.ts`, Function cobrindo 6 linhas; valida Share total ≈ 1 e CREATED/LAST_MODIFIED → autor correto), `TestOwnershipSkipsFilesWithoutDeclarations` (File sem declaração não gera OWNS), `TestOwnershipBlameMissingFileIsSoftError` (File fantasma só loga em stderr), `TestOwnershipWithSubdir` (blame recebe `Subdir + "/" + path`). |
+
+**Decisão explícita:** Variable só é "ownable" quando é top-level de um arquivo JS/TS (owner é o File). Variáveis locais a funções/blocos herdariam `OWNS` da função, duplicando atribuição e inflando o grafo.
+
+**Decisão explícita:** `innermost` escolhe a declaração de **menor span** que contém a linha. Isso significa que uma linha dentro de um método de uma classe atribui `OWNS` para o método, não para a classe. Para ter autoria da classe inteira seria preciso somar OWNS dos métodos + fields em query — decidido ficar fora desta sprint.
+
+**Decisão explícita:** Teams, CODEOWNERS e `.rhaxis-teams.yaml` ficam fora do produto por enquanto. `MemberOfEdge` segue na whitelist do Neo4j mas sem emissão. Reavaliar quando houver usuário real pedindo rollup por time.
+
+## Sprint G4 — Signals + cross-service URL/env (2026-10-02)
+
+Quarta sprint. Link cross-service por **inferência de sinais** — sem exigir arquivo de configuração entre serviços. Granularidade de v1 é App → App; refinamento para Call → Endpoint fica como follow-up quando literais de argumento virarem nodes do grafo.
+
+| Item | Mudanças |
+|---|---|
+| `entity.Topic`, `entity.LinkReview` | Novos nodes. Topic tem ID global `topic:<broker>:<name>` para convergir PRODUCES/CONSUMES de apps diferentes no mesmo node (Sprint 5). LinkReview tem ID escopado `<appKey>:review:<sha1[:12]>`, portanto sumido no re-extract da app, exceto reviews com Status=confirmed/overridden/rejected (preservados pelo repositório). |
+| `entity.Application` ganhou sinais | `Endpoints []string` (formato "METHOD PATH"), `EnvVarsRead []string`, `HostCandidates []string`. Todos opcionais; serializam como arrays de strings — suportado nativamente por Neo4j. |
+| `entity.LinkReview.Candidate*` | Candidatos são `[]string`+`[]int`+`[]string` paralelos (`CandidateTargets`, `CandidateScores`, `CandidateWhys`) porque Neo4j não aceita list of maps como property. Len deve ser igual nos três. |
+| Edges novas | `ProducesEdge` e `ConsumesEdge` em `entity/edge.go` (reservadas pra Sprint 5). `RequestsEdge` já existia e foi reaproveitada. Whitelist Neo4j atualizada. |
+| `ResolutionAmbiguous` | Nova constante Resolution. Marca REQUESTS quando há empate forte no topo dos candidatos — a edge aponta pro top mas há `LinkReview` pendente. |
+| `extractor/crosservice/signals.go` | `SignalsEnricher` (implementa `extractor.Enricher`). Varre o grafo e popula a Application: Endpoints (dos nodes `Endpoint`), EnvVarsRead (das edges `READS → External{name=process}` com `Member` começando com `env.` — pega só o primeiro componente antes do próximo ponto). HostCandidates é extraído por regex (`urlLiteralRE`) direto do conteúdo dos arquivos via `source.Provider`. Limites de corte: top 50 endpoints / 20 envs / 20 hosts para não inchar a Application. |
+| `extractor/crosservice/url_resolver.go` | R1. Para cada host da `src`, pontua apps alvo: +2 se o alvo também lista o host, +2 se o `nameMatch` entre host head e Key/Name do alvo bate. `nameMatch` normaliza underscore/hífen e aceita prefixos `name-...` / `name_...`. |
+| `extractor/crosservice/env_resolver.go` | R2. Para cada env lida pela `src`, pontua: +2 se o alvo lê a mesma env, senão +1 se o prefixo (até o primeiro `_`) casa com Key/Name do alvo. Prefixo não existente → score 0. |
+| `extractor/crosservice/linker.go` | `Link(apps)` roda R1+R2 para todas as apps. Regra de resolução: 1 candidato → `exact` se score top>=2, senão `inferred`; 2+ com empate no topo → top vira edge `ambiguous` + LinkReview pendente; 0 candidatos → silêncio (incrementa `Unmatched`). ID do LinkReview é `sha1(src|kind|hint)[:12]`, portanto reruns reaplicam sem duplicar. |
+| `extractor/repository/neo4j/query.go` | Repository ganhou `LoadApplications`, `ReplaceCrossServiceLinks`, `ListPendingReviews`, `SetReviewStatus`, `UpdateRequestsTarget`, `DeleteRequestsEdge`, `AuditUnlinkedExternals`. `ReplaceCrossServiceLinks` apaga REQUESTS/PRODUCES/CONSUMES da app src + LinkReview com Status=pending (preserva confirmed/overridden/rejected) antes de inserir o novo conjunto; portanto idempotente. |
+| CLI reescrito pra subcomandos | `extractor/cmd/main.go` passa a despachar subcomando (default = `extract` pra compat). Novo `link-services` com sub-sub-comandos: `link` (padrão), `review`, `confirm <reviewID>`, `override <reviewID> <targetID>`, `reject <reviewID>`, `audit`. `audit` lista Call → External HTTP (fetch/axios/request/got/http) sem REQUESTS saindo da app. Tudo via Cypher no Neo4j. |
+| Signals wired em todo `extract` | `buildEnrichers` sempre inclui `SignalsEnricher` (recebe o `source.Provider`). Sem custo quando o grafo não tem endpoints / env vars / URLs. |
+| Testes | 5 testes de signals (endpoints, env vars, host candidates via `local.New` + tempdir, no-src skip, auto-attach), 6 testes do linker (exact by name, ambíguo com review, no match → unmatched, env prefix inferred, self-link ignorado, review ID determinístico). Todos passando. |
+
+**Decisão explícita:** Granularidade de v1 do REQUESTS é App → App, não Call → Endpoint. Fazer Call → Endpoint hoje exigiria materializar argumentos de string como nodes do grafo (hoje são texto solto no `CalleeText`/arg index). Esse refinamento entra quando um usuário real precisar — ou quando Sprint 5 introduzir literais nomeados.
+
+**Decisão explícita:** HostCandidates é extraído por **regex sobre o texto do arquivo**, não por traversal do grafo. O trade-off: 2x I/O (parser + regex), mas evita mudar o parser para emitir literais e evita que a precisão de inferência dependa de resolve de concatenação de strings. A regex é restrita a `(https?|wss?)://host[:port]`, portanto não casa `foo:bar` sem protocolo.
+
+**Decisão explícita:** `link-services` só roda com Neo4j (`NEO4J_URI` obrigatório). O modo in-memory extrai uma app por vez — não há "banco de apps" pra ligar. A denormalização de sinais na Application funciona em ambos os modos; só o cross-link requer Neo4j.
+
+**Decisão explícita:** Resolver nunca prompta durante `extract`. Sempre que há ambiguidade, cria um `LinkReview` que o humano revisa depois com `review`/`confirm`/`override`/`reject`. Isso mantém `extract` 100% automatizável em CI.
+
+**Fora do escopo desta sprint:** Sprint 5 (R3 — PRODUCES/CONSUMES via tópicos Kafka/RabbitMQ/SQS), R4 — SDK alias (depende de library extraction).
+
+## Sprint G5 — Topics PRODUCES/CONSUMES (2026-10-02)
+
+Quinta sprint. R3 do plano cross-service. Detecta chamadas de mensageria no código JS/TS e liga a `Function` que contém a chamada a um `Topic` global. Apps diferentes convergem no mesmo `Topic` (`topic:<broker>:<name>`), e é por essa convergência — não por edge direta — que o grafo mostra producer → consumer.
+
+| Item | Mudanças |
+|---|---|
+| `extractor/crosservice/topics.go` | `TopicsEnricher{Src}` implementa `extractor.Enricher`. Para cada file do source, lê o conteúdo via `source.Provider.ReadFile`, roda duas regex: `positionalRE` casa `<callee>.<method>('T', ...)` com aspa simples/dupla/backtick; `objectRE` casa `<callee>.<method>({topic\|QueueUrl\|TopicArn: 'name', ...})`. Line number vem de `bytes.Count(data[:match], '\n') + 1`. |
+| Mapeamento broker | `brokerFromCallee` por prefixo do callee: `kafka*`/`producer`/`consumer` → kafka; `rabbit*`/`channel` → rabbitmq; `sqs*` → sqs; `sns*` → sns; `redis*` → redis; `pubsub*` → pubsub. Prefixo desconhecido → `"unknown"` (ainda emite Topic). |
+| Normalização de nome | `normalizeTopicName` strippa prefixo de URL do SQS (`https://sqs.us-east-1.amazonaws.com/123/my-queue` → `my-queue`) e de ARN do SNS (`arn:aws:sns:us-east-1:123:my-topic` → `my-topic`). Para outros brokers devolve raw. |
+| Mapeamento call → Function | `collectFunctionsByFile` indexa todas as `Function` do grafo por FileID com span ascendente; `innermostFn` escolhe a Function de menor span que contém a linha do hit — reusa o padrão de `authorship/ownership.go`. Hit fora de qualquer função é silenciosamente ignorado. |
+| Emissão | Para cada hit mapeado: cria `entity.Topic{Name, Broker}` com ID global se ainda não existir (dedupe por `topicsSeen`), e adiciona `entity.Edge{Type: PRODUCES\|CONSUMES, From: fn.ID, To: topic.ID, Resolution: inferred}`. `CONSUMES` quando o método é `consume\|subscribe\|receiveMessage\|psubscribe`; o resto é `PRODUCES`. |
+| Wire-up | `extractor/cmd/main.go` em `buildEnrichers` adiciona `crosservice.TopicsEnricher{Src: src}` logo depois do `SignalsEnricher`. Roda sempre; no-op se `Src` for nil (modo in-memory sem source não entra aqui, mas o guard é barato). |
+| Testes | 7 testes em `topics_test.go`: PRODUCES de kafka.send, CONSUMES de .subscribe, object-style sendMessage com SQS QueueUrl (strip), chamada fora de qualquer Function não emite, dois grafos convergem no mesmo `topic:kafka:shared` com PRODUCES/CONSUMES separados, Topic pré-existente não é duplicado, Src nil é no-op. Todos passando. |
+
+**Decisão explícita:** detecção por regex sobre o conteúdo do arquivo, igual R1 (HostCandidates). Mesmo trade-off: 2x I/O vs. mudar o parser para materializar argumentos literais como nodes. O ganho é não acoplar a sprint ao parser e cobrir patterns de SDK que o AST normalmente não desembrulha (`sqs.sendMessage({QueueUrl: '...'})`).
+
+**Decisão explícita:** Topic ID é global (`topic:<broker>:<name>`), não escopado por app. Esse é o único caminho pelo qual dois `extract` independentes conversam entre si via mensageria no Neo4j — queries `MATCH (a)-[:PRODUCES]->(t)<-[:CONSUMES]-(b)` descobrem o pipe sem precisar de link direto App→App. Como `deleteApp` só apaga nodes com prefixo `<appKey>:`, Topics sobrevivem a re-extracts.
+
+**Decisão explícita:** quando um callee tem prefixo desconhecido, o Topic ainda é emitido com `broker="unknown"`. A alternativa (filtrar) silenciaria uso real de mensageria por SDKs/wrappers não listados. O humano pode re-rotular depois; o grafo mantém o sinal.
+
+**Fora do escopo desta sprint:** R4 (SDK alias / library extraction), merge de topics com nomes semelhantes (`orders.created` vs `orders.create`), detecção de headers de mensagem / schemas, mapping para Call-level ao invés de Function-level.
+
 ## Pendente (ordenado por valor)
 
 ### Crítico (destrava leitura de função)

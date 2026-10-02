@@ -37,6 +37,15 @@ const (
 	// contrato
 	EndpointNode  = NodeType("Endpoint")
 	HttpParamNode = NodeType("HttpParam")
+
+	// autoria
+	CommitNode = NodeType("Commit")
+	PersonNode = NodeType("Person")
+	TeamNode   = NodeType("Team")
+
+	// cross-service
+	TopicNode      = NodeType("Topic")
+	LinkReviewNode = NodeType("LinkReview")
 )
 
 type Node interface {
@@ -95,6 +104,14 @@ type Application struct {
 	Base
 	Name string `json:"name"`
 	Key  string `json:"key"`
+	// Sinais denormalizados pelo passo crosservice/signals para lookup O(1) no
+	// linker cross-service. Cada entrada em Endpoints é "METHOD PATH" (ex.:
+	// "GET /users/:id"). EnvVarsRead lista nomes de env (`process.env.X` → "X").
+	// HostCandidates lista hosts literais que o próprio código menciona em URLs
+	// (ex.: "users:8080" ou "api.internal"). Opcionais, podem vir vazios.
+	Endpoints      []string `json:"endpoints,omitempty"`
+	EnvVarsRead    []string `json:"envVarsRead,omitempty"`
+	HostCandidates []string `json:"hostCandidates,omitempty"`
 }
 
 func (Application) Type() NodeType { return ApplicationNode }
@@ -354,3 +371,72 @@ type HttpParam struct {
 func (HttpParam) Type() NodeType { return HttpParamNode }
 
 // Futuro: node Telemetry{Kind: log, span; Template} ligado por EMITS a partir do Call que emite.
+
+// Commit representa um commit do git. ID global ("commit:<sha>"), compartilhado entre apps
+// que vivem no mesmo repo. Persistido fora do prefixo <appKey:>, portanto sobrevive à
+// reextração da aplicação.
+type Commit struct {
+	Base
+	SHA         string `json:"sha"`
+	Message     string `json:"message"`
+	AuthoredAt  string `json:"authoredAt"`  // RFC3339
+	CommittedAt string `json:"committedAt"` // RFC3339
+	Parent      string `json:"parent,omitempty"`
+}
+
+func (Commit) Type() NodeType { return CommitNode }
+
+// Person representa a identidade de um autor/committer. ID global
+// ("person:<sha1(email_normalizado)>"). Email pode ser gravado em plano, hash ou vazio
+// conforme AuthorshipConfig.StoreEmail (plain|hash|none).
+type Person struct {
+	Base
+	Name        string `json:"name"`
+	Email       string `json:"email,omitempty"`
+	GithubLogin string `json:"githubLogin,omitempty"`
+}
+
+func (Person) Type() NodeType { return PersonNode }
+
+// Team é um grupo nomeado de Person. ID global ("team:<slug>").
+type Team struct {
+	Base
+	Name    string   `json:"name"`
+	Members []string `json:"members,omitempty"`
+}
+
+func (Team) Type() NodeType { return TeamNode }
+
+// Topic representa uma fila/stream (Kafka, RabbitMQ, SNS, SQS, Redis, ...).
+// ID global ("topic:<broker>:<name>") para que PRODUCES/CONSUMES de apps
+// diferentes convirjam no mesmo node. Broker "unknown" é aceito quando o
+// resolver só identificou o nome mas não detectou o cliente.
+type Topic struct {
+	Base
+	Name   string `json:"name"`
+	Broker string `json:"broker"`
+}
+
+func (Topic) Type() NodeType { return TopicNode }
+
+// LinkReview é um item de revisão humana gerado quando os resolvers de
+// cross-service encontram mais de um candidato forte. ID escopado pela app
+// de origem ("<appKey>:review:<sha1 do call site>") para ser removido junto
+// com a reextração dessa app.
+//
+// Candidatos são armazenados como três slices paralelos de escalares para
+// casar com o modelo de properties do Neo4j (sem lists of maps). Len dos três
+// deve ser igual; usar NewLinkReview para construir corretamente.
+type LinkReview struct {
+	Base
+	CallID           string   `json:"callId"`
+	EdgeType         EdgeType `json:"edgeType"`
+	ChosenID         string   `json:"chosenId"`
+	CandidateTargets []string `json:"candidateTargets,omitempty"`
+	CandidateScores  []int    `json:"candidateScores,omitempty"`
+	CandidateWhys    []string `json:"candidateWhys,omitempty"`
+	Hint             string   `json:"hint,omitempty"`
+	Status           string   `json:"status"` // pending|confirmed|rejected|overridden
+}
+
+func (LinkReview) Type() NodeType { return LinkReviewNode }

@@ -44,15 +44,30 @@ const (
 
 	// decorator: Call → Class|Function|Parameter|Field
 	DecoratesEdge = EdgeType("DECORATES")
+
+	// autoria
+	AuthoredByEdge   = EdgeType("AUTHORED_BY")   // Commit → Person
+	CommittedByEdge  = EdgeType("COMMITTED_BY")  // Commit → Person (emitida quando committer ≠ author)
+	ChangedEdge      = EdgeType("CHANGED")       // Commit → File (kind: A|M|D|R|C|T; renamedFrom opcional)
+	MemberOfEdge     = EdgeType("MEMBER_OF")     // Person → Team
+	OwnsEdge         = EdgeType("OWNS")          // Person|Team → declaração|File (source: blame|codeowners|config; share 0..1)
+	CreatedEdge      = EdgeType("CREATED")       // Person → declaração
+	LastModifiedEdge = EdgeType("LAST_MODIFIED") // Person → declaração
+
+	// cross-service
+	ProducesEdge = EdgeType("PRODUCES") // Function → Topic
+	ConsumesEdge = EdgeType("CONSUMES") // Function → Topic
+	// REQUESTS: Call → Endpoint (R1 URL literal) ou Call → Application (R2 env fallback)
 )
 
 // Resolution indica a confiança de uma edge de resolução, fluxo ou contrato
 type Resolution string
 
 const (
-	ResolutionExact    = Resolution("exact")     // escopo/import, sem ambiguidade
-	ResolutionInferred = Resolution("inferred")  // tipo inferido, fallback de export, casamento de rota
-	ResolutionNameOnly = Resolution("name_only") // casado só pelo nome
+	ResolutionExact     = Resolution("exact")     // escopo/import, sem ambiguidade
+	ResolutionInferred  = Resolution("inferred")  // tipo inferido, fallback de export, casamento de rota
+	ResolutionNameOnly  = Resolution("name_only") // casado só pelo nome
+	ResolutionAmbiguous = Resolution("ambiguous") // múltiplos candidatos com score; LinkReview pendente
 )
 
 type Edge struct {
@@ -67,6 +82,13 @@ type Edge struct {
 	Member     string     `json:"member,omitempty"`
 	Operator   string     `json:"operator,omitempty"`
 	Resolution Resolution `json:"resolution,omitempty"`
+	// Kind é um discriminador livre por tipo de edge:
+	// CHANGED: "added" | "modified" | "deleted" | "renamed" | "copied" | "touched"
+	// OWNS:    "blame" | "codeowners" | "config"
+	Kind string `json:"kind,omitempty"`
+	// Share é uma fração (0..1) usada por OWNS para peso de autoria. Zero significa
+	// não setado; serializadores devem omitir quando <=0.
+	Share float64 `json:"share,omitempty"`
 }
 
 func IntPtr(i int) *int { return &i }
